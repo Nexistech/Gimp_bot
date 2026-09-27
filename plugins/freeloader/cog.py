@@ -7,20 +7,10 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
-try:
-    from config import ROLES_TO_TAG, FREELOADER_EXEMPT_IDS
-except ImportError:
-    ROLES_TO_TAG = []
-    FREELOADER_EXEMPT_IDS = []
-try:
-    from config import FREELOADER_CHANNEL_ID
-except ImportError:
-    from config import SPAM_CHANNEL_ID as FREELOADER_CHANNEL_ID
+from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "freeloader_monitor.db")
-FREELOADER_POSITION_NAME = "Freeloader"
-FREELOADER_DAYS_IN_FACTION_MIN = 30
-FREELOADER_IDLE_DAYS = 7
+PLUGIN_DIR = os.path.dirname(__file__)
 
 
 def utc_now():
@@ -36,10 +26,21 @@ def normalize_username(username):
 
 
 class FreeloaderMonitor(commands.Cog):
+    SETTINGS_SCHEMA = [
+        {"key": "position_name", "type": "str", "label": "Freeloader rank name", "default": "Freeloader"},
+        {"key": "days_in_faction_min", "type": "int", "label": "Minimum days in faction", "default": 30},
+        {"key": "idle_days", "type": "int", "label": "Idle days before review", "default": 7},
+        {"key": "exempt_ids", "type": "int_list", "label": "Exempt Torn IDs", "default": []},
+    ]
+
     def __init__(self, bot):
         self.bot = bot
+        self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.initialize_db()
         self.daily_freeloader_check.start()
+
+    def reload_settings(self, data=None):
+        self.settings = data or load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
 
     def cog_unload(self):
         self.daily_freeloader_check.cancel()
@@ -100,13 +101,15 @@ class FreeloaderMonitor(commands.Cog):
         )
 
     async def post_message(self, content):
-        channel = self.bot.get_channel(FREELOADER_CHANNEL_ID)
+        root = load_root_settings()
+        channel_id = int(root.get("FREELOADER_CHANNEL_ID") or root.get("SPAM_CHANNEL_ID") or 0)
+        channel = self.bot.get_channel(channel_id)
         if channel is None:
             print("[Freeloader] Channel not found.")
             return False
         role_mentions = []
         if channel.guild:
-            for role_name in ROLES_TO_TAG:
+            for role_name in root.get("ROLES_TO_TAG") or []:
                 role = discord.utils.get(channel.guild.roles, name=role_name)
                 if role:
                     role_mentions.append(role.mention)
@@ -126,26 +129,30 @@ class FreeloaderMonitor(commands.Cog):
             return
         try:
             now_ts = int(utc_now().timestamp())
-            threshold_ts = now_ts - (FREELOADER_IDLE_DAYS * 24 * 60 * 60)
+            idle_days = int(self.settings.get("idle_days") or 7)
+            min_days = int(self.settings.get("days_in_faction_min") or 30)
+            position_name = str(self.settings.get("position_name") or "Freeloader")
+            exempt = set(self.settings.get("exempt_ids") or [])
+            threshold_ts = now_ts - (idle_days * 24 * 60 * 60)
             for member in roster.all_members():
                 user_id = member.get("id") or member.get("user_id")
                 try:
                     user_id = int(user_id)
                 except (TypeError, ValueError):
                     continue
-                if user_id in FREELOADER_EXEMPT_IDS:
+                if user_id in exempt:
                     continue
-                if int(member.get("days_in_faction") or 0) < FREELOADER_DAYS_IN_FACTION_MIN:
+                if int(member.get("days_in_faction") or 0) < min_days:
                     continue
                 username = member.get("name", "Unknown")
                 position = str(member.get("position") or "").strip()
                 is_in_oc = bool(member.get("is_in_oc", False))
                 last_completed_at = roster.last_completed(user_id)
-                if position.lower() == FREELOADER_POSITION_NAME.lower() and is_in_oc:
+                if position.lower() == position_name.lower() and is_in_oc:
                     if not self.already_notified(user_id, "restore_from_freeloader", last_completed_at):
                         msg = (
                             f"✅ **Freeloader Status Review**\n"
-                            f"`{username}` [{user_id}] is ranked **{FREELOADER_POSITION_NAME}** but has joined an OC."
+                            f"`{username}` [{user_id}] is ranked **{position_name}** but has joined an OC."
                         )
                         if await self.post_message(msg):
                             self.record_notification(user_id, username, "restore_from_freeloader", last_completed_at)
@@ -157,7 +164,7 @@ class FreeloaderMonitor(commands.Cog):
                         msg = (
                             f"⚠️ **Freeloader Review**\n"
                             f"`{username}` [{user_id}] has no recent OC participation. "
-                            f"Review for **{FREELOADER_POSITION_NAME}**."
+                            f"Review for **{position_name}**."
                         )
                         if await self.post_message(msg):
                             self.record_notification(user_id, username, "move_to_freeloader", last_completed_at)
