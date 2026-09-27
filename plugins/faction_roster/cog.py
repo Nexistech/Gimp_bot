@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import os
 import sqlite3
@@ -300,6 +301,19 @@ class FactionRoster(commands.Cog):
 
     def known_names(self):
         return set(self.members_by_name.keys())
+
+    async def wait_until_populated(self, timeout_seconds=180):
+        """Block plugin loops until the first successful member refresh (or timeout)."""
+        await self.bot.wait_until_ready()
+        if self.members_by_id:
+            return True
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        while asyncio.get_event_loop().time() < deadline:
+            if self.members_by_id:
+                return True
+            await asyncio.sleep(1)
+        print("[Roster] Timed out waiting for member data.")
+        return bool(self.members_by_id)
 
     def last_completed(self, user_id):
         try:

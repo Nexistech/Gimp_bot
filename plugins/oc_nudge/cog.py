@@ -177,6 +177,9 @@ class OCNudgeMonitor(commands.Cog):
     @nudge_task.before_loop
     async def before_nudge(self):
         await self.bot.wait_until_ready()
+        roster = self.get_roster()
+        if roster:
+            await roster.wait_until_populated()
 
     oc_group = app_commands.Group(name="oc_nudge", description="Manage OC Nudge exemptions")
 

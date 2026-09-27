@@ -82,6 +82,7 @@ class StrikeCommands(commands.Cog):
         self.initialize_db()
         self.cleanup_old_records()
         self.normalize_existing_usernames()
+        self.backfill_user_ids()
         self.daily_task.start()
         self.oc_monitor_task.start()
 
@@ -115,12 +116,18 @@ class StrikeCommands(commands.Cog):
         c.execute(
             """CREATE TABLE IF NOT EXISTS strikes (
                 id INTEGER PRIMARY KEY,
+                user_id INTEGER,
                 game_username TEXT NOT NULL,
                 strike_datetime TEXT NOT NULL,
                 striker_discord_id INTEGER NOT NULL,
                 reason TEXT
             )"""
         )
+        cols = {row[1] for row in c.execute("PRAGMA table_info(strikes)")}
+        if "user_id" not in cols:
+            c.execute("ALTER TABLE strikes ADD COLUMN user_id INTEGER")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_strikes_user_id ON strikes(user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_strikes_username ON strikes(game_username)")
         c.execute(
             """CREATE TABLE IF NOT EXISTS oc_delay_incidents (
                 id INTEGER PRIMARY KEY,
@@ -150,6 +157,63 @@ class StrikeCommands(commands.Cog):
 
     def normalize_existing_usernames(self):
         self.db_operation("UPDATE strikes SET game_username = LOWER(TRIM(game_username))")
+
+    def resolve_user_id(self, username):
+        roster = self.get_roster()
+        if not roster:
+            return None
+        member = roster.get_member_by_name(username)
+        if member:
+            return int(member.get("id") or member.get("user_id"))
+        return None
+
+    def backfill_user_ids(self):
+        roster = self.get_roster()
+        if not roster or not roster.members_by_name:
+            return
+        rows = self.db_operation(
+            "SELECT id, game_username FROM strikes WHERE user_id IS NULL", fetch=True
+        ) or []
+        for strike_id, name in rows:
+            member = roster.get_member_by_name(name)
+            if not member:
+                continue
+            uid = member.get("id") or member.get("user_id")
+            self.db_operation("UPDATE strikes SET user_id = ? WHERE id = ?", (int(uid), strike_id))
+
+    def strike_count_for(self, username=None, user_id=None):
+        if user_id:
+            row = self.db_operation(
+                "SELECT COUNT(*) FROM strikes WHERE user_id = ?", (int(user_id),), fetch=True
+            )
+            if row and row[0][0]:
+                return row[0][0]
+        if username:
+            return self.db_operation(
+                "SELECT COUNT(*) FROM strikes WHERE game_username = ?",
+                (self.normalize_username(username),),
+                fetch=True,
+            )[0][0]
+        return 0
+
+    def fetch_strike_rows(self, username=None, user_id=None):
+        if user_id:
+            rows = self.db_operation(
+                """SELECT id, user_id, game_username, strike_datetime, striker_discord_id, reason
+                   FROM strikes WHERE user_id = ? ORDER BY strike_datetime DESC""",
+                (int(user_id),),
+                fetch=True,
+            )
+            if rows:
+                return rows
+        if username:
+            return self.db_operation(
+                """SELECT id, user_id, game_username, strike_datetime, striker_discord_id, reason
+                   FROM strikes WHERE game_username = ? ORDER BY strike_datetime DESC""",
+                (self.normalize_username(username),),
+                fetch=True,
+            ) or []
+        return []
 
     def cleanup_old_records(self):
         cutoff_iso = (self.utc_now() - datetime.timedelta(days=STRIKE_RETENTION_DAYS)).isoformat()
@@ -263,23 +327,27 @@ class StrikeCommands(commands.Cog):
             return False
 
     async def _issue_strike_logic(
-        self, username, interaction=None, reason="Manual strike issued.", performer_display=None
+        self,
+        username,
+        interaction=None,
+        reason="Manual strike issued.",
+        performer_display=None,
+        user_id=None,
     ):
         username_norm = self.normalize_username(username)
+        if user_id is None:
+            user_id = self.resolve_user_id(username)
         self.db_operation(
-            "INSERT INTO strikes (game_username, strike_datetime, striker_discord_id, reason) VALUES (?, ?, ?, ?)",
+            "INSERT INTO strikes (user_id, game_username, strike_datetime, striker_discord_id, reason) VALUES (?, ?, ?, ?, ?)",
             (
+                int(user_id) if user_id else None,
                 username_norm,
                 self.utc_now_iso(),
                 interaction.user.id if interaction else 0,
                 reason,
             ),
         )
-        strike_count = self.db_operation(
-            "SELECT COUNT(*) FROM strikes WHERE game_username = ?",
-            (username_norm,),
-            fetch=True,
-        )[0][0]
+        strike_count = self.strike_count_for(username=username_norm, user_id=user_id)
         success = await self.report_action(
             username, "STRIKE ISSUED", strike_count, interaction, performer_display, reason
         )
@@ -354,6 +422,7 @@ class StrikeCommands(commands.Cog):
                     member.get("name", str(user_id)),
                     reason=reason,
                     performer_display="**AUTOMATED**",
+                    user_id=int(user_id),
                 )
                 self.db_operation(
                     """INSERT OR IGNORE INTO oc_delay_incidents
@@ -383,13 +452,21 @@ class StrikeCommands(commands.Cog):
         except Exception as e:
             print(f"[Strike] OC monitor failed: {e}")
 
+    async def _wait_for_roster(self):
+        await self.bot.wait_until_ready()
+        roster = self.get_roster()
+        if roster:
+            await roster.wait_until_populated()
+        await self.fetch_faction_members()
+        self.backfill_user_ids()
+
     @daily_task.before_loop
     async def before_daily(self):
-        await self.bot.wait_until_ready()
+        await self._wait_for_roster()
 
     @oc_monitor_task.before_loop
     async def before_oc_monitor(self):
-        await self.bot.wait_until_ready()
+        await self._wait_for_roster()
 
     @app_commands.command(name="check", description="Checks bot status.")
     async def check_command(self, interaction: discord.Interaction):
@@ -428,19 +505,25 @@ class StrikeCommands(commands.Cog):
                 f"You need the **{ALLOWED_ROLE_NAME}** role to use this.", ephemeral=True
             )
         username_norm = self.normalize_username(username)
-        row = self.db_operation(
-            "SELECT id FROM strikes WHERE game_username = ? ORDER BY strike_datetime ASC LIMIT 1",
-            (username_norm,),
-            fetch=True,
-        )
+        user_id = self.resolve_user_id(username)
+        if user_id:
+            row = self.db_operation(
+                "SELECT id FROM strikes WHERE user_id = ? ORDER BY strike_datetime ASC LIMIT 1",
+                (int(user_id),),
+                fetch=True,
+            )
+        else:
+            row = None
+        if not row:
+            row = self.db_operation(
+                "SELECT id FROM strikes WHERE game_username = ? ORDER BY strike_datetime ASC LIMIT 1",
+                (username_norm,),
+                fetch=True,
+            )
         if not row:
             return await interaction.followup.send(f"No strikes found for `{username}`.", ephemeral=True)
         self.db_operation("DELETE FROM strikes WHERE id = ?", (row[0][0],))
-        strike_count = self.db_operation(
-            "SELECT COUNT(*) FROM strikes WHERE game_username = ?",
-            (username_norm,),
-            fetch=True,
-        )[0][0]
+        strike_count = self.strike_count_for(username=username_norm, user_id=user_id)
         await self.report_action(
             username,
             "STRIKE REMOVED",
@@ -461,13 +544,12 @@ class StrikeCommands(commands.Cog):
                 f"You need the **{ALLOWED_ROLE_NAME}** role to use this.", ephemeral=True
             )
         username_norm = self.normalize_username(username)
-        count = self.db_operation(
-            "SELECT COUNT(*) FROM strikes WHERE game_username = ?",
-            (username_norm,),
-            fetch=True,
-        )[0][0]
+        user_id = self.resolve_user_id(username)
+        count = self.strike_count_for(username=username_norm, user_id=user_id)
         if not count:
             return await interaction.followup.send(f"No strikes found for `{username}`.", ephemeral=True)
+        if user_id:
+            self.db_operation("DELETE FROM strikes WHERE user_id = ?", (int(user_id),))
         self.db_operation("DELETE FROM strikes WHERE game_username = ?", (username_norm,))
         await self.report_action(
             username,
@@ -477,6 +559,47 @@ class StrikeCommands(commands.Cog):
             defined_message=f"Cleared {count} strike(s).",
         )
         await interaction.followup.send(f"Cleared **{count}** strike(s) from `{username}`.", ephemeral=True)
+
+    @app_commands.command(name="strikes", description="Show strike history for a faction member.")
+    async def strikes_command(self, interaction: discord.Interaction, username: str):
+        await interaction.response.defer(ephemeral=True)
+        if not self.is_allowed_role(interaction):
+            return await interaction.followup.send(
+                f"You need the **{ALLOWED_ROLE_NAME}** role to use this.", ephemeral=True
+            )
+        await self.fetch_faction_members()
+        self.backfill_user_ids()
+        user_id = None
+        display_name = username
+        if username.isdigit():
+            user_id = int(username)
+            roster = self.get_roster()
+            member = roster.get_member(user_id) if roster else None
+            if member:
+                display_name = member.get("name", username)
+        else:
+            user_id = self.resolve_user_id(username)
+            member = self.get_roster().get_member_by_name(username) if self.get_roster() else None
+            if member:
+                display_name = member.get("name", username)
+                user_id = member.get("id") or member.get("user_id")
+        rows = self.fetch_strike_rows(username=username, user_id=user_id)
+        if not rows:
+            return await interaction.followup.send(
+                f"No strikes found for `{display_name}`.", ephemeral=True
+            )
+        lines = []
+        for _id, uid, name, when, striker, reason in rows[:15]:
+            who = f"<@{striker}>" if striker else "automated"
+            tid = uid or "?"
+            lines.append(f"• `{when}` — {reason or 'No reason'} (id `{tid}`, by {who})")
+        extra = "" if len(rows) <= 15 else f"\n…and {len(rows) - 15} older strike(s)."
+        await interaction.followup.send(
+            f"**{display_name}** has **{len(rows)}** strike(s) in the last {STRIKE_RETENTION_DAYS} days.\n"
+            + "\n".join(lines)
+            + extra,
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot):

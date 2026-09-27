@@ -157,6 +157,9 @@ class RankMonitor(commands.Cog):
     @rank_check_task.before_loop
     async def before_rank_check(self):
         await self.bot.wait_until_ready()
+        roster = self.get_roster()
+        if roster:
+            await roster.wait_until_populated()
 
 
 async def setup(bot: commands.Bot):
