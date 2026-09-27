@@ -1,0 +1,47 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+config.py
+*.pem
+*.key
+
+# Process / runtime
+bot.pid
+*.pid
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Plugin databases and logs
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+*.log.*
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.bak
