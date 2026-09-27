@@ -193,7 +193,12 @@ class OCNudgeMonitor(commands.Cog):
             username = member.get("name", "Unknown")
             time_ago_str = format_time_ago(last_ts)
             profile_url = f"https://www.torn.com/profiles.php?XID={user_id}"
-            discord_member = self.find_discord_member(channel.guild, username)
+            discord_id = member.get("discord_id")
+            if discord_id:
+                content = f"<@{discord_id}>"
+            else:
+                discord_member = self.find_discord_member(channel.guild, username)
+                content = discord_member.mention if discord_member else None
             embed = discord.Embed(
                 title="Member OC Join Required",
                 description=(
@@ -203,7 +208,6 @@ class OCNudgeMonitor(commands.Cog):
                 color=discord.Color.orange(),
             )
             embed.set_footer(text=f"Torn ID: {user_id}")
-            content = discord_member.mention if discord_member else None
             try:
                 await channel.send(content=content, embed=embed)
                 self.record_nudge(user_id, last_ts)
