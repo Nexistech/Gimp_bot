@@ -112,22 +112,41 @@ class OCNudgeMonitor(commands.Cog):
             (user_id, last_ts, utc_now().isoformat()),
         )
 
+    def _member_names(self, member):
+        names = []
+        for raw in (
+            getattr(member, "display_name", None),
+            getattr(member, "name", None),
+            getattr(member, "nick", None),
+            getattr(member, "global_name", None),
+        ):
+            if raw:
+                names.append(str(raw).strip().lower())
+        return names
+
     def find_discord_member(self, guild, torn_username):
         if not guild:
             return None
-        target_name = torn_username.strip().lower()
+        target_name = (torn_username or "").strip().lower()
+        if not target_name:
+            return None
         for member in guild.members:
-            if member.display_name.strip().lower() == target_name or (
-                member.global_name and member.global_name.strip().lower() == target_name
-            ):
+            if target_name in self._member_names(member):
                 return member
         for member in guild.members:
-            if target_name in member.display_name.lower():
+            display = (getattr(member, "display_name", None) or "").lower()
+            if target_name in display:
                 return member
         return None
 
     @tasks.loop(minutes=CHECK_MINUTES)
     async def nudge_task(self):
+        try:
+            await self._run_nudges()
+        except Exception as e:
+            print(f"[OC Nudge] Task failed: {e}")
+
+    async def _run_nudges(self):
         roster = self.get_roster()
         if not roster or not roster.members_by_id:
             print("[OC Nudge] Roster empty; skipping.")
