@@ -223,10 +223,14 @@ class OCCPRMonitor(commands.Cog):
             profile = f"https://www.torn.com/profiles.php?XID={person['user_id']}"
             extra = f" ({person['position']})" if person.get("position") else ""
             lines.append(f"• [{name}]({profile}){extra} — CPR **{person['cpr']:g}**")
-            if mention_discord and channel.guild:
-                discord_member = self.find_discord_member(channel.guild, name)
-                if discord_member:
-                    mentions.append(discord_member.mention)
+            if mention_discord:
+                discord_id = member.get("discord_id") if member else None
+                if discord_id:
+                    mentions.append(f"<@{discord_id}>")
+                elif channel.guild:
+                    discord_member = self.find_discord_member(channel.guild, name)
+                    if discord_member:
+                        mentions.append(discord_member.mention)
         embed = discord.Embed(
             title="OC CPR out of range",
             description=(
