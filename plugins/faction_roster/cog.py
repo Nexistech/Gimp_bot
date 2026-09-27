@@ -10,6 +10,7 @@ from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
 from plugin_settings import load_settings, schema_defaults
+
 try:
     from config import TORN_API_KEY, FACTION_MEMBERS_URL, FACTION_CRIMES_URL
 except ImportError:
@@ -19,8 +20,8 @@ except ImportError:
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "faction_roster.db")
 MEMBER_REFRESH_MINUTES = 10
-CRIME_REFRESH_MINUTES = 10
 MAX_COMPLETED_PAGES = 8
+DISCORD_LOOKUP_DELAY = 1.2
 
 
 def utc_now():
@@ -56,6 +57,7 @@ class FactionRoster(commands.Cog):
         self.initialize_db()
         self.load_cache_from_db()
         self.refresh_task.start()
+        self.weekly_discord_backfill.start()
 
     def reload_settings(self, data=None):
         self.settings = data or load_settings(os.path.dirname(__file__), schema_defaults(self.SETTINGS_SCHEMA))
@@ -64,6 +66,7 @@ class FactionRoster(commands.Cog):
 
     def cog_unload(self):
         self.refresh_task.cancel()
+        self.weekly_discord_backfill.cancel()
 
     def db(self):
         conn = sqlite3.connect(DB_NAME)
@@ -87,6 +90,8 @@ class FactionRoster(commands.Cog):
                 last_action_status TEXT,
                 last_action_at INTEGER,
                 last_completed_crime_at INTEGER,
+                discord_id TEXT,
+                discord_checked_at TEXT,
                 updated_at TEXT NOT NULL
             )
             """
@@ -94,6 +99,10 @@ class FactionRoster(commands.Cog):
         cols = {row[1] for row in c.execute("PRAGMA table_info(members)")}
         if "last_completed_crime_at" not in cols:
             c.execute("ALTER TABLE members ADD COLUMN last_completed_crime_at INTEGER")
+        if "discord_id" not in cols:
+            c.execute("ALTER TABLE members ADD COLUMN discord_id TEXT")
+        if "discord_checked_at" not in cols:
+            c.execute("ALTER TABLE members ADD COLUMN discord_checked_at TEXT")
         conn.commit()
         conn.close()
 
@@ -144,6 +153,49 @@ class FactionRoster(commands.Cog):
             async with session.get(url, timeout=timeout_seconds) as response:
                 response.raise_for_status()
                 return await response.json()
+
+    async def lookup_discord_id(self, torn_id):
+        if not TORN_API_KEY:
+            return None
+        url = f"https://api.torn.com/v2/user/{int(torn_id)}/discord?key={TORN_API_KEY}"
+        try:
+            data = await self.fetch_json(url)
+        except Exception as exc:
+            print(f"[Roster] Discord lookup failed for {torn_id}: {exc}")
+            return None
+        discord = data.get("discord") or {}
+        discord_id = discord.get("discord_id") or discord.get("id")
+        return str(discord_id) if discord_id else None
+
+    def save_discord_id(self, torn_id, discord_id):
+        now = utc_now_iso()
+        conn = self.db()
+        conn.execute(
+            "UPDATE members SET discord_id = COALESCE(?, discord_id), discord_checked_at = ? WHERE user_id = ?",
+            (discord_id, now, int(torn_id)),
+        )
+        conn.commit()
+        conn.close()
+        member = self.members_by_id.get(int(torn_id))
+        if member:
+            if discord_id:
+                member["discord_id"] = discord_id
+            member["discord_checked_at"] = now
+
+    async def fetch_discord_ids(self, torn_ids, reason="backfill"):
+        ids = []
+        for raw in torn_ids:
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        print(f"[Roster] Discord lookup ({reason}) for {len(ids)} member(s).")
+        for torn_id in ids:
+            discord_id = await self.lookup_discord_id(torn_id)
+            self.save_discord_id(torn_id, discord_id)
+            if discord_id:
+                print(f"[Roster] Linked Torn {torn_id} -> Discord {discord_id}")
+            await asyncio.sleep(DISCORD_LOOKUP_DELAY)
 
     async def fetch_paginated_crimes(self, cat, max_pages=MAX_COMPLETED_PAGES):
         offset = 0
@@ -198,9 +250,11 @@ class FactionRoster(commands.Cog):
         url = self.build_torn_url(FACTION_MEMBERS_URL)
         data = await self.fetch_json(url)
         members = data.get("members", []) or []
+        previous = dict(self.members_by_id)
         by_id = {}
         by_name = {}
         now = utc_now_iso()
+        new_ids = []
         conn = self.db()
         c = conn.cursor()
         seen = []
@@ -213,6 +267,9 @@ class FactionRoster(commands.Cog):
             status = member.get("status") or {}
             last_action = member.get("last_action") or {}
             last_completed = self.last_completed_by_user.get(user_id)
+            existing = previous.get(user_id) or {}
+            if user_id not in previous:
+                new_ids.append(user_id)
             row = {
                 "id": user_id,
                 "user_id": user_id,
@@ -226,6 +283,8 @@ class FactionRoster(commands.Cog):
                 "last_action_status": str(last_action.get("status") or ""),
                 "last_action_at": last_action.get("timestamp"),
                 "last_completed_crime_at": last_completed,
+                "discord_id": existing.get("discord_id"),
+                "discord_checked_at": existing.get("discord_checked_at"),
                 "raw": member,
                 "updated_at": now,
             }
@@ -237,8 +296,8 @@ class FactionRoster(commands.Cog):
                 INSERT INTO members (
                     user_id, name, name_norm, position, days_in_faction, is_in_oc,
                     status_state, status_description, last_action_status, last_action_at,
-                    last_completed_crime_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_completed_crime_at, discord_id, discord_checked_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     name=excluded.name,
                     name_norm=excluded.name_norm,
@@ -250,6 +309,7 @@ class FactionRoster(commands.Cog):
                     last_action_status=excluded.last_action_status,
                     last_action_at=excluded.last_action_at,
                     last_completed_crime_at=COALESCE(excluded.last_completed_crime_at, members.last_completed_crime_at),
+                    discord_id=COALESCE(members.discord_id, excluded.discord_id),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -264,6 +324,8 @@ class FactionRoster(commands.Cog):
                     row["last_action_status"],
                     row["last_action_at"],
                     last_completed,
+                    row.get("discord_id"),
+                    row.get("discord_checked_at"),
                     now,
                 ),
             )
@@ -276,11 +338,14 @@ class FactionRoster(commands.Cog):
         self.members_by_name = by_name
         self.last_member_refresh = utc_now()
         print(f"[Roster] Refreshed {len(by_id)} members.")
+        if new_ids:
+            self.bot.loop.create_task(self.fetch_discord_ids(new_ids, reason="new member"))
         return len(by_id)
 
     async def refresh_crimes(self):
+        max_pages = int(self.settings.get("max_completed_pages") or MAX_COMPLETED_PAGES)
         available = await self.fetch_paginated_crimes("available", max_pages=5)
-        completed = await self.fetch_paginated_crimes("completed", max_pages=MAX_COMPLETED_PAGES)
+        completed = await self.fetch_paginated_crimes("completed", max_pages=max_pages)
         self.active_crimes = available
         self.completed_crimes = completed
         self.last_completed_by_user = self.build_last_completed_map(completed)
@@ -315,7 +380,6 @@ class FactionRoster(commands.Cog):
         return set(self.members_by_name.keys())
 
     async def wait_until_populated(self, timeout_seconds=180):
-        """Block plugin loops until the first successful member refresh (or timeout)."""
         await self.bot.wait_until_ready()
         if self.members_by_id:
             return True
@@ -348,6 +412,21 @@ class FactionRoster(commands.Cog):
     @refresh_task.before_loop
     async def before_refresh(self):
         await self.bot.wait_until_ready()
+
+    @tasks.loop(hours=24.0 * 7)
+    async def weekly_discord_backfill(self):
+        missing = [
+            member["user_id"]
+            for member in self.all_members()
+            if not member.get("discord_id")
+        ]
+        if missing:
+            await self.fetch_discord_ids(missing, reason="weekly missing")
+
+    @weekly_discord_backfill.before_loop
+    async def before_weekly_discord(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(30)
 
 
 async def setup(bot: commands.Bot):
