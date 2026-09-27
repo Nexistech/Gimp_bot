@@ -17,6 +17,7 @@ except ImportError:
 DB_NAME = os.path.join(os.path.dirname(__file__), "oc_nudge.db")
 OC_NUDGE_DAYS = 3
 CHECK_MINUTES = 60
+MIN_DAYS_IN_FACTION = 25
 
 
 def utc_now():
@@ -164,6 +165,8 @@ class OCNudgeMonitor(commands.Cog):
             except (TypeError, ValueError):
                 continue
             if user_id in ignored_ids:
+                continue
+            if int(member.get("days_in_faction") or 0) < MIN_DAYS_IN_FACTION:
                 continue
             if bool(member.get("is_in_oc", False)):
                 continue
