@@ -7,19 +7,14 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
-try:
-    from config import SPAM_CHANNEL_ID, ROLES_TO_TAG, ALLOWED_ROLE_NAME
-except ImportError:
-    SPAM_CHANNEL_ID = 0
-    ROLES_TO_TAG = []
-    ALLOWED_ROLE_NAME = "Concierge"
+from plugin_settings import load_root_settings
 
 try:
     from plugins.strike_management.plugin import AUTO_STRIKE_DELAY_HOURS
 except ImportError:
     AUTO_STRIKE_DELAY_HOURS = 4
 
-CHECK_HOUR_UTC = 23
+CHECK_HOUR_UTC = 16
 MAX_LINES = 12
 MIN_DAYS_AFTER_RECRUIT = 3
 FREELOADER_DAYS_IN_FACTION_MIN = 30
@@ -42,7 +37,8 @@ class DailyDigest(commands.Cog):
         return self.bot.get_cog("FactionRoster")
 
     def is_allowed_role(self, interaction: discord.Interaction):
-        return any(role.name == ALLOWED_ROLE_NAME for role in interaction.user.roles)
+        allowed = str(load_root_settings().get("ALLOWED_ROLE_NAME") or "Concierge")
+        return any(role.name == allowed for role in interaction.user.roles)
 
     def format_list(self, items):
         if not items:
@@ -149,18 +145,19 @@ class DailyDigest(commands.Cog):
         embed.set_footer(text="Info only — no automated action from this digest.")
         return embed
 
-    async def post_digest(self, channel=None):
+    async def post_digest(self, channel=None, mention_roles=True):
         data = self.collect_sections()
         if not data:
             return False, "Roster is empty."
         embed = self.build_embed(data)
+        root = load_root_settings()
         if channel is None:
-            channel = self.bot.get_channel(SPAM_CHANNEL_ID)
+            channel = self.bot.get_channel(int(root.get("SPAM_CHANNEL_ID") or 0))
         if channel is None:
-            return False, "Spam channel not found."
+            return False, "No channel available for the digest."
         mentions = []
-        if getattr(channel, "guild", None):
-            for role_name in ROLES_TO_TAG:
+        if mention_roles and getattr(channel, "guild", None):
+            for role_name in root.get("ROLES_TO_TAG") or []:
                 role = discord.utils.get(channel.guild.roles, name=role_name)
                 if role:
                     mentions.append(role.mention)
@@ -187,13 +184,19 @@ class DailyDigest(commands.Cog):
     @app_commands.command(name="digest", description="Post the faction review digest now.")
     async def digest_command(self, interaction: discord.Interaction):
         if not self.is_allowed_role(interaction):
+            allowed = str(load_root_settings().get("ALLOWED_ROLE_NAME") or "Concierge")
             return await interaction.response.send_message(
-                f"You need the **{ALLOWED_ROLE_NAME}** role to use this.", ephemeral=True
+                f"You need the **{allowed}** role to use this.", ephemeral=True
             )
         await interaction.response.defer(ephemeral=True)
-        ok, err = await self.post_digest()
+        target = interaction.channel
+        if target is None:
+            return await interaction.followup.send(
+                "I can't see the channel this was used in.", ephemeral=True
+            )
+        ok, err = await self.post_digest(channel=target, mention_roles=False)
         if ok:
-            await interaction.followup.send("Digest posted to the spam channel.", ephemeral=True)
+            await interaction.followup.send("Digest posted here.", ephemeral=True)
         else:
             await interaction.followup.send(f"Could not post digest: {err}", ephemeral=True)
 
