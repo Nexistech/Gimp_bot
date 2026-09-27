@@ -9,6 +9,7 @@ import aiohttp
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+from plugin_settings import load_settings, schema_defaults
 try:
     from config import TORN_API_KEY, FACTION_MEMBERS_URL, FACTION_CRIMES_URL
 except ImportError:
@@ -37,6 +38,11 @@ def normalize_username(username):
 class FactionRoster(commands.Cog):
     """Single Torn puller. Other plugins read this cache/DB instead of calling Torn."""
 
+    SETTINGS_SCHEMA = [
+        {"key": "member_refresh_minutes", "type": "int", "label": "Member refresh minutes", "default": 10},
+        {"key": "max_completed_pages", "type": "int", "label": "Max completed-crime pages", "default": 8},
+    ]
+
     def __init__(self, bot):
         self.bot = bot
         self.members_by_id = {}
@@ -46,9 +52,15 @@ class FactionRoster(commands.Cog):
         self.last_completed_by_user = {}
         self.last_member_refresh = None
         self.last_crime_refresh = None
+        self.settings = load_settings(os.path.dirname(__file__), schema_defaults(self.SETTINGS_SCHEMA))
         self.initialize_db()
         self.load_cache_from_db()
         self.refresh_task.start()
+
+    def reload_settings(self, data=None):
+        self.settings = data or load_settings(os.path.dirname(__file__), schema_defaults(self.SETTINGS_SCHEMA))
+        minutes = max(1, int(self.settings.get("member_refresh_minutes") or 10))
+        self.refresh_task.change_interval(minutes=minutes)
 
     def cog_unload(self):
         self.refresh_task.cancel()
