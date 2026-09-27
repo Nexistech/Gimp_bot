@@ -45,3 +45,10 @@ Thumbs.db
 .idea/
 .vscode/
 *.bak
+.bash_history
+.bash_logout
+.bashrc
+.local/
+.profile
+.sqlite_history
+.ssh/
