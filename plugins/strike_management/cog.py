@@ -12,13 +12,11 @@ import aiohttp
 
 sys.path.append(os.getcwd())
 from config import (
-    ALLOWED_ROLE_NAME,
-    SPAM_CHANNEL_ID,
-    ROLES_TO_TAG,
     FACTION_MEMBERS_URL,
     FACTION_CRIMES_URL,
     TORN_API_KEY,
 )
+from plugin_settings import load_root_settings
 from plugins.strike_management.plugin import (
     AUTO_STRIKE_DELAY_HOURS,
     AUTO_MONITOR_MINUTES,
@@ -73,6 +71,8 @@ class FactionMemberView(ui.View):
 
 
 class StrikeCommands(commands.Cog):
+    SETTINGS_SCHEMA = []
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.active_members_cache = set()
@@ -220,8 +220,12 @@ class StrikeCommands(commands.Cog):
         self.db_operation("DELETE FROM strikes WHERE strike_datetime < ?", (cutoff_iso,))
         self.db_operation("DELETE FROM oc_delay_incidents WHERE strike_issued_at < ?", (cutoff_iso,))
 
+    def allowed_role_name(self):
+        return str(load_root_settings().get("ALLOWED_ROLE_NAME") or "Concierge")
+
     def is_allowed_role(self, interaction: discord.Interaction):
-        return any(role.name == ALLOWED_ROLE_NAME for role in interaction.user.roles)
+        allowed = self.allowed_role_name()
+        return any(role.name == allowed for role in interaction.user.roles)
 
     def get_roster(self):
         return self.bot.get_cog("FactionRoster")
@@ -305,12 +309,14 @@ class StrikeCommands(commands.Cog):
         performer_display=None,
         defined_message=None,
     ):
-        spam_channel = self.bot.get_channel(SPAM_CHANNEL_ID)
+        root = load_root_settings()
+        spam_channel = self.bot.get_channel(int(root.get("SPAM_CHANNEL_ID") or 0))
         if not spam_channel:
             print("[Strike] SPAM_CHANNEL_ID not found.")
             return False
+        tag_roles = set(root.get("ROLES_TO_TAG") or [])
         role_mentions = [
-            role.mention for role in spam_channel.guild.roles if role.name in ROLES_TO_TAG
+            role.mention for role in spam_channel.guild.roles if role.name in tag_roles
         ]
         actor = performer_display or (interaction.user.mention if interaction else "**AUTOMATED**")
         report_message = (
@@ -482,7 +488,7 @@ class StrikeCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         if not self.is_allowed_role(interaction):
             return await interaction.followup.send(
-                f"You need the **{ALLOWED_ROLE_NAME}** role to use this.", ephemeral=True
+                f"You need the **{self.allowed_role_name()}** role to use this.", ephemeral=True
             )
         await self.fetch_faction_members()
         if self.normalize_username(username) in self.active_members_cache:
@@ -502,7 +508,7 @@ class StrikeCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         if not self.is_allowed_role(interaction):
             return await interaction.followup.send(
-                f"You need the **{ALLOWED_ROLE_NAME}** role to use this.", ephemeral=True
+                f"You need the **{self.allowed_role_name()}** role to use this.", ephemeral=True
             )
         username_norm = self.normalize_username(username)
         user_id = self.resolve_user_id(username)
@@ -541,7 +547,7 @@ class StrikeCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         if not self.is_allowed_role(interaction):
             return await interaction.followup.send(
-                f"You need the **{ALLOWED_ROLE_NAME}** role to use this.", ephemeral=True
+                f"You need the **{self.allowed_role_name()}** role to use this.", ephemeral=True
             )
         username_norm = self.normalize_username(username)
         user_id = self.resolve_user_id(username)
@@ -565,7 +571,7 @@ class StrikeCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         if not self.is_allowed_role(interaction):
             return await interaction.followup.send(
-                f"You need the **{ALLOWED_ROLE_NAME}** role to use this.", ephemeral=True
+                f"You need the **{self.allowed_role_name()}** role to use this.", ephemeral=True
             )
         await self.fetch_faction_members()
         self.backfill_user_ids()
@@ -600,6 +606,82 @@ class StrikeCommands(commands.Cog):
             + extra,
             ephemeral=True,
         )
+
+    def web_tables(self):
+        rows = self.db_operation(
+            """SELECT id, user_id, game_username, strike_datetime, reason
+               FROM strikes ORDER BY strike_datetime DESC LIMIT 200""",
+            fetch=True,
+        ) or []
+        table_rows = []
+        for strike_id, user_id, name, when, reason in rows:
+            table_rows.append(
+                {
+                    "id": strike_id,
+                    "When": when,
+                    "Member": f"{name} ({user_id or '?'})",
+                    "Reason": reason or "",
+                }
+            )
+        add_form = """
+        <form method="post" action="/plugin/__PLUGIN__/action">
+          <input type="hidden" name="action" value="add_strike">
+          <label>Torn ID</label>
+          <input name="user_id" placeholder="Torn ID">
+          <label>Username (used if ID is blank)</label>
+          <input name="username" placeholder="In-game name">
+          <label>Reason</label>
+          <input name="reason" placeholder="Manual strike from web config">
+          <button type="submit">Add strike</button>
+        </form>
+        """
+        return [
+            {
+                "title": "Recent strikes",
+                "columns": ["When", "Member", "Reason"],
+                "rows": table_rows,
+                "remove_action": "remove_strike",
+                "add_form": add_form,
+            }
+        ]
+
+    def web_action(self, data):
+        action = data.get("action")
+        if action == "remove_strike":
+            strike_id = int(data.get("id"))
+            row = self.db_operation(
+                "SELECT game_username FROM strikes WHERE id = ?", (strike_id,), fetch=True
+            )
+            self.db_operation("DELETE FROM strikes WHERE id = ?", (strike_id,))
+            name = row[0][0] if row else "unknown"
+            return f"Removed strike #{strike_id} from {name}."
+        if action == "add_strike":
+            user_id = str(data.get("user_id") or "").strip()
+            username = str(data.get("username") or "").strip()
+            reason = str(data.get("reason") or "Manual strike from web config").strip()
+            roster = self.get_roster()
+            member = None
+            if user_id.isdigit() and roster:
+                member = roster.get_member(int(user_id))
+            if not member and username and roster:
+                member = roster.get_member_by_name(username)
+            if member:
+                username = member.get("name") or username
+                user_id = member.get("id") or member.get("user_id")
+            if not username and not user_id:
+                return "Provide a Torn ID or username."
+            self.db_operation(
+                "INSERT INTO strikes (user_id, game_username, strike_datetime, striker_discord_id, reason) VALUES (?, ?, ?, ?, ?)",
+                (
+                    int(user_id) if str(user_id).isdigit() else None,
+                    self.normalize_username(username or str(user_id)),
+                    self.utc_now_iso(),
+                    0,
+                    reason,
+                ),
+            )
+            return f"Added strike for {username or user_id}."
+        return "Unknown action."
 
 
 async def setup(bot: commands.Bot):
