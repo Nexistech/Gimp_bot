@@ -8,16 +8,10 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
-try:
-    from config import SPAM_CHANNEL_ID, FREELOADER_EXEMPT_IDS
-except ImportError:
-    SPAM_CHANNEL_ID = 0
-    FREELOADER_EXEMPT_IDS = []
+from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "oc_nudge.db")
-OC_NUDGE_DAYS = 3
-CHECK_MINUTES = 60
-MIN_DAYS_IN_FACTION = 25
+PLUGIN_DIR = os.path.dirname(__file__)
 
 
 def utc_now():
@@ -42,10 +36,29 @@ def format_time_ago(last_ts):
 
 
 class OCNudgeMonitor(commands.Cog):
+    SETTINGS_SCHEMA = [
+        {"key": "oc_nudge_days", "type": "int", "label": "Days since last OC before nudge", "default": 3},
+        {"key": "check_minutes", "type": "int", "label": "Check interval (minutes)", "default": 60},
+        {"key": "min_days_in_faction", "type": "int", "label": "Minimum days in faction before nudge", "default": 25},
+        {
+            "key": "exempt_ids",
+            "type": "int_list",
+            "label": "Exempt Torn IDs",
+            "default": [],
+            "help": "These IDs plus the SQLite ignore list are skipped.",
+        },
+    ]
+
     def __init__(self, bot):
         self.bot = bot
+        self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.initialize_db()
         self.nudge_task.start()
+
+    def reload_settings(self, data=None):
+        self.settings = data or load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
+        minutes = max(1, int(self.settings.get("check_minutes") or 60))
+        self.nudge_task.change_interval(minutes=minutes)
 
     def cog_unload(self):
         self.nudge_task.cancel()
@@ -89,7 +102,7 @@ class OCNudgeMonitor(commands.Cog):
     def get_ignored_ids(self):
         rows = self.db_operation("SELECT user_id FROM oc_ignored_users", fetch=True)
         db_ignored = {row[0] for row in rows} if rows else set()
-        return db_ignored.union(set(FREELOADER_EXEMPT_IDS))
+        return db_ignored.union(set(self.settings.get("exempt_ids") or []))
 
     def already_nudged(self, user_id, last_ts):
         rows = self.db_operation(
@@ -140,7 +153,7 @@ class OCNudgeMonitor(commands.Cog):
                 return member
         return None
 
-    @tasks.loop(minutes=CHECK_MINUTES)
+    @tasks.loop(minutes=60)
     async def nudge_task(self):
         try:
             await self._run_nudges()
@@ -152,13 +165,15 @@ class OCNudgeMonitor(commands.Cog):
         if not roster or not roster.members_by_id:
             print("[OC Nudge] Roster empty; skipping.")
             return
-        channel = self.bot.get_channel(SPAM_CHANNEL_ID)
+        root = load_root_settings()
+        channel_id = int(root.get("SPAM_CHANNEL_ID") or 0)
+        channel = self.bot.get_channel(channel_id)
         if not channel:
-            print(f"[OC Nudge] SPAM_CHANNEL_ID ({SPAM_CHANNEL_ID}) not found.")
+            print(f"[OC Nudge] SPAM_CHANNEL_ID ({channel_id}) not found.")
             return
         ignored_ids = self.get_ignored_ids()
         now_ts = int(utc_now().timestamp())
-        threshold_ts = now_ts - (OC_NUDGE_DAYS * 86400)
+        threshold_ts = now_ts - (int(self.settings.get("oc_nudge_days") or 3) * 86400)
         for member in roster.all_members():
             try:
                 user_id = int(member.get("id") or member.get("user_id"))
@@ -166,7 +181,7 @@ class OCNudgeMonitor(commands.Cog):
                 continue
             if user_id in ignored_ids:
                 continue
-            if int(member.get("days_in_faction") or 0) < MIN_DAYS_IN_FACTION:
+            if int(member.get("days_in_faction") or 0) < int(self.settings.get("min_days_in_faction") or 25):
                 continue
             if bool(member.get("is_in_oc", False)):
                 continue
@@ -193,7 +208,7 @@ class OCNudgeMonitor(commands.Cog):
                 await channel.send(content=content, embed=embed)
                 self.record_nudge(user_id, last_ts)
             except discord.Forbidden:
-                print(f"[OC Nudge] Forbidden sending to {SPAM_CHANNEL_ID}.")
+                print(f"[OC Nudge] Forbidden sending to {channel_id}.")
                 return
 
     @nudge_task.before_loop
@@ -226,7 +241,7 @@ class OCNudgeMonitor(commands.Cog):
     async def list_ignored(self, interaction: discord.Interaction):
         rows = self.db_operation("SELECT user_id FROM oc_ignored_users", fetch=True)
         db_ids = [str(r[0]) for r in rows] if rows else []
-        config_ids = [str(i) for i in FREELOADER_EXEMPT_IDS]
+        config_ids = [str(i) for i in (self.settings.get("exempt_ids") or [])]
         all_ignored = sorted(set(db_ids + config_ids))
         if not all_ignored:
             return await interaction.response.send_message("No users are currently ignored.", ephemeral=True)
