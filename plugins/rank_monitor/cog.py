@@ -7,24 +7,10 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
-try:
-    from config import SPAM_CHANNEL_ID, ROLES_TO_TAG
-except ImportError:
-    SPAM_CHANNEL_ID = 0
-    ROLES_TO_TAG = []
+from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "rank_monitor.db")
-CHECK_MINUTES = 30
-MIN_DAYS_AFTER_RECRUIT = 3
-POSITION_RECRUIT = "recruit"
-POSITION_MEMBER = "member"
-POSITION_FLUFFER = "fluffer"
-POSITION_TALENT = "talent"
-POSITION_FREELOADER = "freeloader"
-IGNORE_POSITIONS = {
-    POSITION_TALENT,
-    POSITION_FREELOADER,
-}
+PLUGIN_DIR = os.path.dirname(__file__)
 
 
 def utc_now_iso():
@@ -32,10 +18,25 @@ def utc_now_iso():
 
 
 class RankMonitor(commands.Cog):
+    SETTINGS_SCHEMA = [
+        {"key": "check_minutes", "type": "int", "label": "Check interval (minutes)", "default": 30},
+        {"key": "min_days_after_recruit", "type": "int", "label": "Days after join before rank review", "default": 3},
+        {"key": "position_recruit", "type": "str", "label": "Recruit title", "default": "Recruit"},
+        {"key": "position_member", "type": "str", "label": "Member title", "default": "Member"},
+        {"key": "position_fluffer", "type": "str", "label": "Fluffer title", "default": "Fluffer"},
+        {"key": "position_talent", "type": "str", "label": "Talent title", "default": "Talent"},
+        {"key": "position_freeloader", "type": "str", "label": "Freeloader title", "default": "Freeloader"},
+    ]
+
     def __init__(self, bot):
         self.bot = bot
+        self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.initialize_db()
         self.rank_check_task.start()
+
+    def reload_settings(self, data=None):
+        self.settings = data or load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
+        self.rank_check_task.change_interval(minutes=max(1, int(self.settings.get("check_minutes") or 30)))
 
     def cog_unload(self):
         self.rank_check_task.cancel()
@@ -86,13 +87,14 @@ class RankMonitor(commands.Cog):
         return self.bot.get_cog("FactionRoster")
 
     async def post_message(self, content):
-        channel = self.bot.get_channel(SPAM_CHANNEL_ID)
+        root = load_root_settings()
+        channel = self.bot.get_channel(int(root.get("SPAM_CHANNEL_ID") or 0))
         if channel is None:
             print("[RankMonitor] SPAM_CHANNEL_ID not found.")
             return False
         mentions = []
         if channel.guild:
-            for role_name in ROLES_TO_TAG:
+            for role_name in root.get("ROLES_TO_TAG") or []:
                 role = discord.utils.get(channel.guild.roles, name=role_name)
                 if role:
                     mentions.append(role.mention)
@@ -109,18 +111,24 @@ class RankMonitor(commands.Cog):
         position = (member.get("position") or "").strip().lower()
         days = int(member.get("days_in_faction") or 0)
         in_oc = bool(member.get("is_in_oc"))
+        recruit = str(self.settings.get("position_recruit") or "Recruit").lower()
+        member_title = str(self.settings.get("position_member") or "Member").lower()
+        fluffer = str(self.settings.get("position_fluffer") or "Fluffer").lower()
+        talent = str(self.settings.get("position_talent") or "Talent").lower()
+        freeloader = str(self.settings.get("position_freeloader") or "Freeloader").lower()
+        min_days = int(self.settings.get("min_days_after_recruit") or 3)
 
-        if position in IGNORE_POSITIONS:
+        if position in {talent, freeloader}:
             return None
-        if position == POSITION_RECRUIT or days < MIN_DAYS_AFTER_RECRUIT:
+        if position == recruit or days < min_days:
             return None
-        if position == POSITION_FLUFFER:
+        if position == fluffer:
             return "Talent" if in_oc else None
-        if position == POSITION_MEMBER or position == "":
+        if position == member_title or position == "":
             return "Talent" if in_oc else "Fluffer"
         return None
 
-    @tasks.loop(minutes=CHECK_MINUTES)
+    @tasks.loop(minutes=30)
     async def rank_check_task(self):
         roster = self.get_roster()
         if not roster:
