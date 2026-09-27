@@ -5,6 +5,8 @@
 config.py
 *.pem
 *.key
+settings.json
+plugins/**/settings.json
 
 # Process / runtime
 bot.pid
