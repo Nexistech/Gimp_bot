@@ -103,6 +103,29 @@ class DailyDigest(commands.Cog):
                 f"• {crime.get('name', 'OC')} `{crime.get('id')}` ready ~{hours}h ago"
             )
 
+        missing_tools = []
+        tools_cog = self.bot.get_cog("OCToolsMonitor")
+        if tools_cog:
+            for entry in tools_cog.collect_missing(roster.active_crimes):
+                name, kind, _item_id = tools_cog.item_label(entry["req"])
+                who = entry.get("user_name") or entry.get("user_id")
+                missing_tools.append(
+                    f"• `{who}` missing {name} ({kind}) for {entry['crime_name']}"
+                )
+
+        cpr_issues = []
+        cpr_cog = self.bot.get_cog("OCCPRMonitor")
+        if cpr_cog:
+            for entry in cpr_cog.collect_out_of_range(roster.active_crimes):
+                names = ", ".join(
+                    f"{p.get('user_name') or p['user_id']} {p['cpr']:g}"
+                    for p in entry["offenders"]
+                )
+                cpr_issues.append(
+                    f"• {entry['crime_name']} L{entry['difficulty']} "
+                    f"({entry['low']:g}–{entry['high']:g}): {names}"
+                )
+
         return {
             "members": len(roster.members_by_id),
             "roster_age": roster.last_member_refresh,
@@ -110,6 +133,8 @@ class DailyDigest(commands.Cog):
             "fluffer_to_talent": fluffer_to_talent,
             "idle": idle,
             "delayed_ocs": delayed_ocs,
+            "missing_tools": missing_tools,
+            "cpr_issues": cpr_issues,
         }
 
     def build_embed(self, data):
@@ -140,6 +165,16 @@ class DailyDigest(commands.Cog):
         embed.add_field(
             name=f"OCs ready > {AUTO_STRIKE_DELAY_HOURS}h",
             value=self.format_list(data["delayed_ocs"]),
+            inline=False,
+        )
+        embed.add_field(
+            name="Missing OC tools / consumables",
+            value=self.format_list(data.get("missing_tools") or []),
+            inline=False,
+        )
+        embed.add_field(
+            name="OC CPR out of range",
+            value=self.format_list(data.get("cpr_issues") or []),
             inline=False,
         )
         embed.set_footer(text="Info only — no automated action from this digest.")
