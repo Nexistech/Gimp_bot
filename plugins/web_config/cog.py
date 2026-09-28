@@ -365,8 +365,9 @@ class WebConfig(commands.Cog):
               form.addEventListener("submit", async (ev) => {{
                 ev.preventDefault();
                 const body = new URLSearchParams(new FormData(form));
-                const res = await fetch(form.action, {{
+                const res = await fetch(form.getAttribute("action"), {{
                   method: "POST",
+                  credentials: "same-origin",
                   headers: {{ "X-Requested-With": "fetch" }},
                   body
                 }});
