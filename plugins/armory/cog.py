@@ -308,18 +308,32 @@ class ArmoryTracker(commands.Cog):
                 "title": "Tracked minimums",
                 "columns": ["Category", "Item", "On hand", "Loaned", "Min"],
                 "rows": tracked_rows,
-                "remove_action": "untrack_item",
+                "row_actions": [
+                    {"action": "update_min", "label": "Save min", "include_min": True},
+                    {"action": "untrack_item", "label": "Remove"},
+                ],
                 "add_form": add_form,
             },
             {
                 "title": "In stock and not tracked",
                 "columns": ["Category", "Item", "On hand", "Loaned"],
                 "rows": addable_rows,
+                "row_actions": [
+                    {"action": "track_item", "label": "Track", "include_min": True},
+                ],
             },
         ]
 
     def web_action(self, data):
         action = data.get("action")
+        if action == "update_min":
+            item_id = int(data.get("id"))
+            min_qty = int(data.get("min_qty") or 0)
+            conn = self.db()
+            conn.execute("UPDATE tracked SET min_qty = ? WHERE item_id = ?", (min_qty, item_id))
+            conn.commit()
+            conn.close()
+            return f"Updated minimum for item {item_id} to {min_qty}."
         if action == "untrack_item":
             item_id = int(data.get("id"))
             conn = self.db()

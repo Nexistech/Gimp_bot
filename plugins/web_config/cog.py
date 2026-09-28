@@ -445,21 +445,39 @@ class WebConfig(commands.Cog):
             columns = table.get("columns") or []
             rows = table.get("rows") or []
             action = table.get("remove_action")
+            row_actions = table.get("row_actions") or []
+            if action and not row_actions:
+                row_actions = [{"action": action, "label": "Remove"}]
             add_form = table.get("add_form")
             head = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
-            if action:
+            if row_actions:
                 head += "<th></th>"
             body_rows = []
             for row in rows:
                 cells = "".join(f"<td>{html.escape(str(row.get(col, '')))}</td>" for col in columns)
-                if action:
+                if row_actions:
                     rid = html.escape(str(row.get("id", "")))
-                    cells += (
-                        f'<td><form method="post" action="/plugin/{item["id"]}/action">'
-                        f'<input type="hidden" name="action" value="{html.escape(action)}">'
-                        f'<input type="hidden" name="id" value="{rid}">'
-                        f'<button class="row-btn" type="submit">Remove</button></form></td>'
-                    )
+                    name = html.escape(str(row.get("Item") or row.get("name") or ""))
+                    current_min = html.escape(str(row.get("Min") or row.get("min_qty") or "0"))
+                    buttons = []
+                    for spec in row_actions:
+                        fields = (
+                            f'<input type="hidden" name="action" value="{html.escape(spec["action"])}">'
+                            f'<input type="hidden" name="id" value="{rid}">'
+                            f'<input type="hidden" name="item_name" value="{name}">'
+                        )
+                        if spec.get("include_min"):
+                            fields += (
+                                f'<input name="min_qty" value="{current_min}" '
+                                f'style="width:70px" title="Minimum quantity">'
+                            )
+                        buttons.append(
+                            f'<form method="post" action="/plugin/{item["id"]}/action" style="display:inline">'
+                            f"{fields}"
+                            f'<button class="row-btn" type="submit">{html.escape(spec.get("label") or "Go")}</button>'
+                            f"</form>"
+                        )
+                    cells += f'<td>{" ".join(buttons)}</td>'
                 body_rows.append(f"<tr>{cells}</tr>")
             body = "".join(body_rows) or f'<tr><td colspan="{len(columns)+1}">None</td></tr>'
             extra_form = ""
