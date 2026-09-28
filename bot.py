@@ -21,12 +21,8 @@ def setup_logging():
     file_handler = RotatingFileHandler(LOG_FILE, maxBytes=500_000, backupCount=3)
     file_handler.setFormatter(formatter)
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-
     logger.handlers.clear()
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
 
     logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("discord.http").setLevel(logging.WARNING)
@@ -161,4 +157,3 @@ if __name__ == "__main__":
     create_pid_file()
     log.info("Starting bot")
     bot.run(TOKEN, log_handler=None)
-
