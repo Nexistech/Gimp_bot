@@ -282,20 +282,26 @@ class ArmoryTracker(commands.Cog):
             }
             for row in stock
         ]
-        add_form = """
+        import html as html_lib
+        options = "".join(
+            f'<option value="{html_lib.escape(row["name"], quote=True)}"></option>'
+            for row in stock
+        )
+        add_form = f"""
         <form method="post" action="/plugin/__PLUGIN__/action">
           <input type="hidden" name="action" value="run_now">
           <button type="submit">Refresh armory snapshot now</button>
         </form>
         <form method="post" action="/plugin/__PLUGIN__/action">
           <input type="hidden" name="action" value="track_item">
-          <label>Item ID from the in-stock list below</label>
-          <input name="item_id" placeholder="Item ID">
+          <label>Item name</label>
+          <input name="item_name" list="armory-stock" placeholder="Start typing, e.g. lollipop or beer" autocomplete="off">
+          <datalist id="armory-stock">{options}</datalist>
           <label>Minimum on-hand quantity</label>
           <input name="min_qty" placeholder="100">
           <button type="submit">Track item</button>
         </form>
-        <p class="help">Only items currently in the armory snapshot can be tracked. Run a check or wait for the daily pull if the list is empty.</p>
+        <p class="help">Type an item name from the in-stock list. Item IDs are not needed.</p>
         """
         return [
             {
@@ -322,16 +328,32 @@ class ArmoryTracker(commands.Cog):
             conn.close()
             return f"Stopped tracking item {item_id}."
         if action == "track_item":
-            item_id = int(data.get("item_id"))
             min_qty = int(data.get("min_qty") or 0)
+            name = str(data.get("item_name") or data.get("item_id") or "").strip()
+            if not name:
+                return "Enter an item name from the in-stock list."
             conn = self.db()
-            stock = conn.execute("SELECT name FROM stock WHERE item_id = ?", (item_id,)).fetchone()
+            stock = conn.execute(
+                "SELECT item_id, name FROM stock WHERE lower(name) = lower(?)",
+                (name,),
+            ).fetchone()
             if not stock:
-                conn.close()
-                return f"Item {item_id} is not in the current armory snapshot."
+                stock = conn.execute(
+                    "SELECT item_id, name FROM stock WHERE lower(name) LIKE ? ORDER BY name LIMIT 6",
+                    (f"%{name.lower()}%",),
+                ).fetchall()
+                if len(stock) == 1:
+                    stock = stock[0]
+                elif stock:
+                    choices = ", ".join(row["name"] for row in stock)
+                    conn.close()
+                    return f"Several matches: {choices}. Type the exact name."
+                else:
+                    conn.close()
+                    return f"No in-stock item matches '{name}'. Refresh the snapshot if it should be there."
             conn.execute(
                 "INSERT OR REPLACE INTO tracked (item_id, min_qty, added_at) VALUES (?, ?, ?)",
-                (item_id, min_qty, utc_now().isoformat()),
+                (stock["item_id"], min_qty, utc_now().isoformat()),
             )
             conn.commit()
             conn.close()
