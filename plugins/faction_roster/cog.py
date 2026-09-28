@@ -12,11 +12,11 @@ sys.path.append(os.getcwd())
 from plugin_settings import load_settings, schema_defaults
 
 try:
-    from config import TORN_API_KEY, FACTION_MEMBERS_URL, FACTION_CRIMES_URL
+    from config import TORN_API_KEY
 except ImportError:
     TORN_API_KEY = ""
-    FACTION_MEMBERS_URL = "https://api.torn.com/v2/faction/members"
-    FACTION_CRIMES_URL = "https://api.torn.com/v2/faction/crimes"
+FACTION_MEMBERS_URL = "https://api.torn.com/v2/faction/members"
+FACTION_CRIMES_URL = "https://api.torn.com/v2/faction/crimes"
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "faction_roster.db")
 MEMBER_REFRESH_MINUTES = 10
@@ -149,7 +149,8 @@ class FactionRoster(commands.Cog):
         return parsed._replace(query=urlencode(params)).geturl()
 
     async def fetch_json(self, url, timeout_seconds=20):
-        async with aiohttp.ClientSession() as session:
+        headers = {"User-Agent": "StrikeBot/1.0"}
+        async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=timeout_seconds) as response:
                 response.raise_for_status()
                 return await response.json()
@@ -157,15 +158,23 @@ class FactionRoster(commands.Cog):
     async def lookup_discord_id(self, torn_id):
         if not TORN_API_KEY:
             return None
-        url = f"https://api.torn.com/v2/user/{int(torn_id)}/discord?key={TORN_API_KEY}"
-        try:
-            data = await self.fetch_json(url)
-        except Exception as exc:
-            print(f"[Roster] Discord lookup failed for {torn_id}: {exc}")
-            return None
-        discord = data.get("discord") or {}
-        discord_id = discord.get("discord_id") or discord.get("id")
-        return str(discord_id) if discord_id else None
+        urls = [
+            f"https://api.torn.com/user/{int(torn_id)}?selections=discord&key={TORN_API_KEY}&comment=StrikeBot",
+            f"https://api.torn.com/v2/user/{int(torn_id)}/discord?key={TORN_API_KEY}&comment=StrikeBot",
+        ]
+        for url in urls:
+            try:
+                data = await self.fetch_json(url)
+            except Exception as exc:
+                print(f"[Roster] Discord lookup failed for {torn_id}: {exc}")
+                continue
+            if data.get("error"):
+                print(f"[Roster] Discord API error for {torn_id}: {data['error']}")
+                continue
+            discord = data.get("discord") or {}
+            discord_id = discord.get("discordID") or discord.get("discord_id") or discord.get("id")
+            return str(discord_id) if discord_id else None
+        return None
 
     def save_discord_id(self, torn_id, discord_id):
         now = utc_now_iso()
@@ -431,3 +440,4 @@ class FactionRoster(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(FactionRoster(bot))
+

@@ -11,11 +11,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import aiohttp
 
 sys.path.append(os.getcwd())
-from config import (
-    FACTION_MEMBERS_URL,
-    FACTION_CRIMES_URL,
-    TORN_API_KEY,
-)
+try:
+    from config import TORN_API_KEY
+except ImportError:
+    TORN_API_KEY = ""
+FACTION_MEMBERS_URL = "https://api.torn.com/v2/faction/members"
+FACTION_CRIMES_URL = "https://api.torn.com/v2/faction/crimes"
 from plugin_settings import load_root_settings
 from plugins.strike_management.plugin import (
     AUTO_STRIKE_DELAY_HOURS,

@@ -6,7 +6,8 @@ import atexit
 import logging
 from logging.handlers import RotatingFileHandler
 
-from config import TOKEN, DEV_GUILD_ID
+from config import TOKEN
+from plugin_settings import load_root_settings
 
 PID_FILE = "bot.pid"
 LOG_FILE = "bot.log"
@@ -81,8 +82,9 @@ class StrikeBot(commands.Bot):
         log.info("Cogs now loaded: %s", loaded)
 
     async def sync_guild_commands(self):
-        if DEV_GUILD_ID:
-            guild = discord.Object(id=int(DEV_GUILD_ID))
+        guild_id = int(load_root_settings().get("DEV_GUILD_ID") or 0)
+        if guild_id:
+            guild = discord.Object(id=guild_id)
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
             self.tree.clear_commands(guild=None)
@@ -90,7 +92,7 @@ class StrikeBot(commands.Bot):
             log.info(
                 "Synced %s command(s) to DEV_GUILD_ID %s and cleared global commands.",
                 len(synced),
-                DEV_GUILD_ID,
+                guild_id,
             )
         else:
             synced = await self.tree.sync()
@@ -159,3 +161,4 @@ if __name__ == "__main__":
     create_pid_file()
     log.info("Starting bot")
     bot.run(TOKEN, log_handler=None)
+
