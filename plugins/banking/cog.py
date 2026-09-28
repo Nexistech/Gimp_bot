@@ -206,7 +206,10 @@ class Banking(commands.Cog):
         return data.get("fundsnews") or data.get("news") or {}
 
     def give_url(self, torn_id, amount):
-        return f"{GIVE_URL}&contacter={int(torn_id)}&money={int(amount)}"
+        return (
+            f"{GIVE_URL}&userID={int(torn_id)}&userId={int(torn_id)}"
+            f"&XID={int(torn_id)}&money={int(amount)}"
+        )
 
     def request_embed(self, row, extra=None):
         status = row["status"]
@@ -217,13 +220,18 @@ class Banking(commands.Cog):
             "cancelled": discord.Color.dark_grey(),
             "expired": discord.Color.dark_grey(),
         }.get(status, discord.Color.gold())
+        profile = f"https://www.torn.com/profiles.php?XID={row['torn_id']}"
+        who = row["torn_name"] or f"Torn {row['torn_id']}"
         embed = discord.Embed(
             title=f"Vault withdraw #{row['id']}",
+            description=(
+                f"<@{row['discord_id']}> (**[{who}]({profile})** `{row['torn_id']}`) "
+                f"requested **{format_money(row['amount'])}**."
+            ),
             color=color,
             timestamp=utc_now(),
         )
-        profile = f"https://www.torn.com/profiles.php?XID={row['torn_id']}"
-        embed.add_field(name="Member", value=f"[{row['torn_name']}]({profile}) `{row['torn_id']}`", inline=True)
+        embed.add_field(name="Member", value=f"[{who}]({profile}) `{row['torn_id']}`", inline=True)
         embed.add_field(name="Amount", value=format_money(row["amount"]), inline=True)
         embed.add_field(name="Status", value=status.replace("_", " ").title(), inline=True)
         if row["expires_at"]:
@@ -250,19 +258,23 @@ class Banking(commands.Cog):
             pass
 
     async def create_request(self, interaction: discord.Interaction, amount_text, timeout_text, ephemeral=False):
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except discord.NotFound:
+                pass
         if not self.has_verified_role(interaction.user):
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"You need the **{self.settings.get('verified_role') or 'Verified'}** role to withdraw.",
                 ephemeral=True,
             )
         member = self.resolve_torn_member(interaction.user)
         if not member:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "I can't match your Discord account to a faction member. Verify / wait for a Discord ID backfill.",
                 ephemeral=True,
             )
         torn_id = int(member.get("id") or member.get("user_id"))
-        await interaction.response.defer(ephemeral=True)
         try:
             balance = await self.vault_balance(torn_id)
             amount = parse_amount(amount_text, balance)
@@ -312,11 +324,18 @@ class Banking(commands.Cog):
                 role = discord.utils.get(channel.guild.roles, name=role_name)
                 if role:
                     mentions.append(role.mention)
-        message = await channel.send(
-            content=" ".join(mentions) if mentions else None,
-            embed=self.request_embed(row),
-            view=self.view_for(row),
-        )
+        try:
+            message = await channel.send(
+                content=" ".join(mentions) if mentions else None,
+                embed=self.request_embed(row),
+                view=self.view_for(row),
+            )
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                f"I don't have access to post in <#{channel.id}>. "
+                "Give the bot View Channel + Send Messages + Embed Links there, or pick another banking channel.",
+                ephemeral=True,
+            )
         conn = self.db()
         conn.execute(
             "UPDATE requests SET channel_id = ?, message_id = ? WHERE id = ?",
@@ -460,16 +479,19 @@ class Banking(commands.Cog):
     @app_commands.command(name="withdraw", description="Request money from the faction vault.")
     @app_commands.describe(amount="Amount such as 1,000,000, 1m, 250k, or all", timeout="30m, 60m, 1:30, 4h, or never")
     async def withdraw_command(self, interaction: discord.Interaction, amount: str, timeout: str = None):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         await self.create_request(interaction, amount, timeout)
 
     @app_commands.command(name="balance", description="Show your faction vault balance.")
     async def balance_command(self, interaction: discord.Interaction):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         if not self.has_verified_role(interaction.user):
-            return await interaction.response.send_message("You need the verified role to check vault balance.", ephemeral=True)
+            return await interaction.followup.send("You need the verified role to check vault balance.", ephemeral=True)
         member = self.resolve_torn_member(interaction.user)
         if not member:
-            return await interaction.response.send_message("I can't match your Discord account to a faction member.", ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
+            return await interaction.followup.send("I can't match your Discord account to a faction member.", ephemeral=True)
         try:
             balance = await self.vault_balance(int(member.get("id") or member.get("user_id")))
         except Exception as exc:
