@@ -361,6 +361,31 @@ class WebConfig(commands.Cog):
               setIds(field, parseIds(field).filter((x) => x !== String(id)));
               btn.closest(".chip").remove();
             }});
+            document.querySelectorAll("table form").forEach((form) => {{
+              form.addEventListener("submit", async (ev) => {{
+                ev.preventDefault();
+                const body = new URLSearchParams(new FormData(form));
+                const res = await fetch(form.action, {{
+                  method: "POST",
+                  headers: {{ "X-Requested-With": "fetch" }},
+                  body
+                }});
+                const data = await res.json().catch(() => ({{ ok: false, message: "Request failed" }}));
+                let flash = document.querySelector(".flash");
+                if (!flash) {{
+                  flash = document.createElement("div");
+                  flash.className = "flash";
+                  document.querySelector("main").prepend(flash);
+                }}
+                flash.textContent = data.message || "Saved";
+                flash.className = data.ok === false ? "flash error" : "flash";
+                const row = form.closest("tr");
+                const action = body.get("action");
+                if (data.ok !== false && row && ["track_item", "untrack_item", "remove_subscription", "remove_strike"].includes(action)) {{
+                  row.remove();
+                }}
+              }});
+            }});
             let timer = null;
             document.querySelectorAll(".member-search").forEach((input) => {{
               input.addEventListener("input", () => {{
@@ -494,10 +519,14 @@ class WebConfig(commands.Cog):
         if not item or not item.get("cog") or not hasattr(item["cog"], "web_action"):
             raise web.HTTPNotFound()
         posted = await request.post()
+        ok = True
         try:
             message = item["cog"].web_action(dict(posted))
         except Exception as exc:
+            ok = False
             message = f"Action failed: {exc}"
+        if request.headers.get("X-Requested-With") == "fetch":
+            return web.json_response({"ok": ok, "message": message, "action": posted.get("action"), "id": posted.get("id")})
         return web.Response(text=render_page(self.form_body(item, message)), content_type="text/html")
 
     async def handle_roster_search(self, request):
