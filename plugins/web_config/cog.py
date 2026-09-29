@@ -416,7 +416,7 @@ class WebConfig(commands.Cog):
             <script>
             function hiddenInput(field) {{ return document.getElementById(field); }}
             function parseIds(field) {{
-              return (hiddenInput(field).value || "").split(/[,\\s]+/).filter(Boolean);
+              return (hiddenInput(field).value || "").split(/,/).map((x) => x.trim()).filter(Boolean);
             }}
             function setIds(field, ids) {{
               hiddenInput(field).value = ids.join(", ");
