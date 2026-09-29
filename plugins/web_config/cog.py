@@ -270,6 +270,53 @@ class WebConfig(commands.Cog):
         roles = sorted(roles, key=lambda r: r.name.lower())[:limit]
         return [{"id": role.id, "name": role.name} for role in roles]
 
+    def search_channels(self, query, limit=12):
+        guild = self.config_guild()
+        results = [{"id": 0, "name": "Disabled"}]
+        if not guild:
+            return results[:limit]
+        query = (query or "").strip().lower()
+        channels = [ch for ch in guild.text_channels]
+        if query:
+            channels = [
+                ch
+                for ch in channels
+                if query in ch.name.lower() or query == str(ch.id) or query in {"off", "disable", "disabled"}
+            ]
+        channels = sorted(channels, key=lambda c: (c.position, c.name.lower()))[: limit - 1]
+        results.extend({"id": ch.id, "name": f"#{ch.name}"} for ch in channels)
+        return results
+
+    def discord_channel_html(self, key, label, value, help_html):
+        try:
+            channel_id = int(value or 0)
+        except (TypeError, ValueError):
+            channel_id = 0
+        if channel_id:
+            channel = self.bot.get_channel(channel_id)
+            shown = f"#{channel.name}" if channel else str(channel_id)
+        else:
+            shown = "Disabled"
+        chip = (
+            f'<span class="chip" data-id="{channel_id}">'
+            f"{html.escape(shown)}"
+            f'<button type="button" class="remove-id" data-field="{key}" data-id="{channel_id}">Remove</button>'
+            f"</span>"
+        )
+        return f"""
+        <label>{label}</label>
+        <div class="member-picker" data-field="{key}">
+          <input type="hidden" name="{key}" id="{key}" value="{channel_id}">
+          <div class="chips" id="chips-{key}">{chip}</div>
+          <div class="search-wrap">
+            <input type="text" class="member-search" data-field="{key}" data-source="channels" data-mode="single"
+                   placeholder="Search channels or type disabled" autocomplete="off">
+            <div class="suggest" id="suggest-{key}"></div>
+          </div>
+        </div>
+        {help_html}
+        """
+
     def discord_roles_html(self, key, label, value, help_html, single=False):
         names = []
         if isinstance(value, str):
@@ -318,6 +365,8 @@ class WebConfig(commands.Cog):
             return self.discord_roles_html(key, field["label"], [value] if value else [], help_html, single=True)
         if field.get("widget") == "discord_roles" or key in {"ROLES_TO_TAG"}:
             return self.discord_roles_html(key, field["label"], value or [], help_html, single=False)
+        if field.get("widget") == "discord_channel" or key in {"channel_id", "CHANNEL_ID"}:
+            return self.discord_channel_html(key, field["label"], value, help_html)
         if ftype in {"int_list", "str_list"}:
             display = ", ".join(str(v) for v in (value or []))
             return (
@@ -419,7 +468,7 @@ class WebConfig(commands.Cog):
                 const q = input.value.trim();
                 if (!q) {{ box.style.display = "none"; box.innerHTML = ""; return; }}
                 timer = setTimeout(async () => {{
-                  const url = source === "roles" ? "/api/roles?q=" : "/api/roster?q=";
+                  const url = source === "roles" ? "/api/roles?q=" : source === "channels" ? "/api/channels?q=" : "/api/roster?q=";
                   const res = await fetch(url + encodeURIComponent(q));
                   const rows = await res.json();
                   if (!rows.length) {{
@@ -563,6 +612,12 @@ class WebConfig(commands.Cog):
         query = request.query.get("q", "")
         return web.json_response(self.search_roles(query))
 
+    async def handle_channel_search(self, request):
+        if not self.authorized(request):
+            raise web.HTTPFound("/login")
+        query = request.query.get("q", "")
+        return web.json_response(self.search_channels(query))
+
     async def handle_home(self, request):
         if not self.authorized(request):
             raise web.HTTPFound("/login")
@@ -580,6 +635,7 @@ class WebConfig(commands.Cog):
                 web.post("/plugin/{plugin_id}/action", self.handle_action),
                 web.get("/api/roster", self.handle_roster_search),
                 web.get("/api/roles", self.handle_role_search),
+                web.get("/api/channels", self.handle_channel_search),
             ]
         )
         host = str(self.settings.get("WEB_HOST") or "127.0.0.1")
