@@ -7,7 +7,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
-from plugin_settings import load_root_settings
+from plugin_settings import load_root_settings, load_settings, schema_defaults
+
+PLUGIN_DIR = os.path.dirname(__file__)
 
 try:
     from plugins.strike_management.plugin import AUTO_STRIKE_DELAY_HOURS
@@ -26,12 +28,70 @@ def utc_now():
 
 
 class DailyDigest(commands.Cog):
+    SETTINGS_SCHEMA = [
+        {
+            "key": "exclude_all_ids",
+            "type": "int_list",
+            "label": "Exclude from every digest section",
+            "default": [],
+            "widget": "torn_ids",
+        },
+        {
+            "key": "exclude_member_to_fluffer_ids",
+            "type": "int_list",
+            "label": "Exclude from Member → Fluffer",
+            "default": [],
+            "widget": "torn_ids",
+        },
+        {
+            "key": "exclude_fluffer_to_talent_ids",
+            "type": "int_list",
+            "label": "Exclude from Fluffer → Talent",
+            "default": [],
+            "widget": "torn_ids",
+        },
+        {
+            "key": "exclude_idle_ids",
+            "type": "int_list",
+            "label": "Exclude from idle / activity",
+            "default": [],
+            "widget": "torn_ids",
+        },
+        {
+            "key": "exclude_tools_ids",
+            "type": "int_list",
+            "label": "Exclude from missing OC tools",
+            "default": [],
+            "widget": "torn_ids",
+        },
+        {
+            "key": "exclude_cpr_ids",
+            "type": "int_list",
+            "label": "Exclude from OC CPR",
+            "default": [],
+            "widget": "torn_ids",
+        },
+    ]
+
     def __init__(self, bot):
         self.bot = bot
+        self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.digest_task.start()
+
+    def reload_settings(self, data=None):
+        self.settings = data or load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
 
     def cog_unload(self):
         self.digest_task.cancel()
+
+    def excluded(self, user_id, key):
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return False
+        all_ids = {int(x) for x in (self.settings.get("exclude_all_ids") or []) if str(x).isdigit() or isinstance(x, int)}
+        specific = {int(x) for x in (self.settings.get(key) or []) if str(x).isdigit() or isinstance(x, int)}
+        return user_id in all_ids or user_id in specific
 
     def get_roster(self):
         return self.bot.get_cog("FactionRoster")
@@ -76,15 +136,18 @@ class DailyDigest(commands.Cog):
             if pos_l in {"talent", "freeloader", "recruit"}:
                 pass
             elif days >= MIN_DAYS_AFTER_RECRUIT and pos_l in {"member", ""} and not in_oc:
-                member_to_fluffer.append(line)
+                if not self.excluded(user_id, "exclude_member_to_fluffer_ids"):
+                    member_to_fluffer.append(line)
             elif pos_l == "fluffer" and in_oc:
-                fluffer_to_talent.append(line)
+                if not self.excluded(user_id, "exclude_fluffer_to_talent_ids"):
+                    fluffer_to_talent.append(line)
 
             if (
                 days >= FREELOADER_DAYS_IN_FACTION_MIN
                 and not in_oc
                 and pos_l != "freeloader"
                 and (last_completed is None or last_completed <= idle_cut)
+                and not self.excluded(user_id, "exclude_idle_ids")
             ):
                 idle.append(line)
 
@@ -107,6 +170,8 @@ class DailyDigest(commands.Cog):
         tools_cog = self.bot.get_cog("OCToolsMonitor")
         if tools_cog:
             for entry in tools_cog.collect_missing(roster.active_crimes):
+                if self.excluded(entry.get("user_id"), "exclude_tools_ids"):
+                    continue
                 name, kind, _item_id = tools_cog.item_label(entry["req"])
                 who = entry.get("user_name") or entry.get("user_id")
                 missing_tools.append(
@@ -117,9 +182,16 @@ class DailyDigest(commands.Cog):
         cpr_cog = self.bot.get_cog("OCCPRMonitor")
         if cpr_cog:
             for entry in cpr_cog.collect_out_of_range(roster.active_crimes):
+                offenders = [
+                    p
+                    for p in entry["offenders"]
+                    if not self.excluded(p.get("user_id"), "exclude_cpr_ids")
+                ]
+                if not offenders:
+                    continue
                 names = ", ".join(
                     f"{p.get('user_name') or p['user_id']} {p['cpr']:g}"
-                    for p in entry["offenders"]
+                    for p in offenders
                 )
                 cpr_issues.append(
                     f"• {entry['crime_name']} L{entry['difficulty']} "
