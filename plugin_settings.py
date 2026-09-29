@@ -21,6 +21,29 @@ ROOT_SCHEMA = [
 ]
 
 
+def plugin_folders(root_dir=None):
+    root_dir = root_dir or os.getcwd()
+    plugins_dir = os.path.join(root_dir, "plugins")
+    if not os.path.isdir(plugins_dir):
+        return []
+    folders = []
+    for folder in sorted(os.listdir(plugins_dir)):
+        if folder.startswith("__"):
+            continue
+        if os.path.isfile(os.path.join(plugins_dir, folder, "cog.py")):
+            folders.append(folder)
+    return folders
+
+
+def enabled_plugins(root_dir=None):
+    folders = plugin_folders(root_dir)
+    stored = load_root_settings().get("ENABLED_PLUGINS", None)
+    if stored is None:
+        return list(folders)
+    allowed = {str(name) for name in stored}
+    return [folder for folder in folders if folder in allowed]
+
+
 def settings_path(plugin_dir, filename="settings.json"):
     return os.path.join(plugin_dir, filename)
 

@@ -15,8 +15,10 @@ sys.path.append(os.getcwd())
 from plugin_settings import (
     ROOT_SCHEMA,
     coerce_value,
+    enabled_plugins,
     load_root_settings,
     load_settings,
+    plugin_folders,
     save_settings,
     schema_defaults,
 )
@@ -57,6 +59,7 @@ nav { width:240px; background:#1a1d27; padding:20px 0; border-right:1px solid #2
 nav h1 { font-size:16px; margin:0 20px 16px; }
 nav a { display:block; padding:10px 20px; color:#c5c9d3; text-decoration:none; }
 nav a.active, nav a:hover { background:#2a3148; color:#fff; }
+nav .nav-label { margin:18px 20px 8px; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#8b93a7; }
 main { flex:1; padding:28px 32px; max-width:820px; }
 label { display:block; margin:16px 0 6px; font-weight:600; }
 input, textarea { width:100%; box-sizing:border-box; padding:8px 10px; border-radius:6px;
@@ -109,11 +112,14 @@ class WebConfig(commands.Cog):
     def discover_plugins(self):
         items = [{"id": "bot", "label": "Bot", "schema": ROOT_SCHEMA, "dir": ROOT_DIR}]
         plugins_dir = os.path.join(ROOT_DIR, "plugins")
+        allowed = set(enabled_plugins())
         if not os.path.isdir(plugins_dir):
             return items
         for folder in sorted(os.listdir(plugins_dir)):
             cog_path = os.path.join(plugins_dir, folder, "cog.py")
             if not os.path.isfile(cog_path):
+                continue
+            if folder != "web_config" and folder not in allowed:
                 continue
             cog = self._cog_for_folder(folder)
             schema = getattr(cog, "SETTINGS_SCHEMA", None) if cog else None
@@ -174,11 +180,17 @@ class WebConfig(commands.Cog):
         """
 
     def nav_html(self, active):
-        links = []
+        links = [
+            f'<a class="{"active" if active == "bot" else ""}" href="/plugin/bot">Bot</a>',
+            f'<a class="{"active" if active == "plugins" else ""}" href="/plugins">Plugins</a>',
+        ]
+        links.append('<div class="nav-label">Enabled plugins</div>')
         for item in self.discover_plugins():
+            if item["id"] == "bot":
+                continue
             cls = "active" if item["id"] == active else ""
             links.append(f'<a class="{cls}" href="/plugin/{item["id"]}">{item["label"]}</a>')
-        return "<nav><h1>Plugins</h1>" + "".join(links) + "</nav>"
+        return "<nav><h1>Strike bot</h1>" + "".join(links) + "</nav>"
 
     def roster(self):
         return self.bot.get_cog("FactionRoster")
@@ -618,6 +630,72 @@ class WebConfig(commands.Cog):
         query = request.query.get("q", "")
         return web.json_response(self.search_channels(query))
 
+    async def handle_plugins(self, request):
+        if not self.authorized(request):
+            raise web.HTTPFound("/login")
+        folders = plugin_folders()
+        current_enabled = enabled_plugins()
+        flash = None
+        if request.method == "POST":
+            posted = await request.post()
+            selected = [folder for folder in folders if posted.get(f"plugin_{folder}")]
+            if "web_config" in current_enabled and "web_config" not in selected:
+                confirm = str(posted.get("confirm_disable_web") or "").strip().upper()
+                if confirm != "YES":
+                    flash = "Type YES to disable the web config plugin. It will stay enabled."
+                    selected = list(current_enabled) if current_enabled else folders
+                else:
+                    flash = (
+                        "Web config disabled in settings.json. After this page unloads, "
+                        "re-enable it by adding \"web_config\" to ENABLED_PLUGINS and restarting."
+                    )
+            root = load_root_settings()
+            root["ENABLED_PLUGINS"] = selected
+            save_settings(ROOT_DIR, root)
+            results = []
+            if hasattr(self.bot, "apply_plugin_enabled"):
+                results = await self.bot.apply_plugin_enabled(selected)
+            if not flash:
+                flash = "Plugin list saved. " + (", ".join(results) if results else "No load changes.")
+            current_enabled = selected
+        rows = []
+        for folder in folders:
+            checked = "checked" if folder in current_enabled else ""
+            extra = " <span class=\"help\">required to use this UI</span>" if folder == "web_config" else ""
+            rows.append(
+                f'<label><input type="checkbox" name="plugin_{folder}" value="1" {checked}> '
+                f"{folder.replace('_', ' ')}{extra}</label>"
+            )
+        body = f"""
+        <div class="layout">
+          {self.nav_html("plugins")}
+          <main>
+            <h2>Enabled plugins</h2>
+            {f'<div class="flash">{html.escape(flash)}</div>' if flash else ""}
+            <p class="help">Unchecked plugins are not loaded on startup. Toggling anything except web config reloads that cog now.</p>
+            <form method="post" action="/plugins" id="plugin-form">
+              {''.join(rows)}
+              <label>Type YES to confirm disabling web config</label>
+              <input name="confirm_disable_web" placeholder="YES" autocomplete="off">
+              <button type="submit">Save plugin list</button>
+            </form>
+            <script>
+            document.getElementById("plugin-form").addEventListener("submit", (ev) => {{
+              const box = document.querySelector('input[name="plugin_web_config"]');
+              if (box && !box.checked) {{
+                const typed = (document.querySelector('input[name="confirm_disable_web"]').value || "").trim().toUpperCase();
+                if (typed !== "YES") {{
+                  ev.preventDefault();
+                  alert("Unchecking web config turns off this entire UI. Type YES in the confirm box, then save.");
+                }}
+              }}
+            }});
+            </script>
+          </main>
+        </div>
+        """
+        return web.Response(text=render_page(body), content_type="text/html")
+
     async def handle_home(self, request):
         if not self.authorized(request):
             raise web.HTTPFound("/login")
@@ -627,6 +705,8 @@ class WebConfig(commands.Cog):
         app = web.Application()
         app.add_routes(
             [
+                web.get("/plugins", self.handle_plugins),
+                web.post("/plugins", self.handle_plugins),
                 web.get("/", self.handle_home),
                 web.get("/login", self.handle_login),
                 web.post("/login", self.handle_login),

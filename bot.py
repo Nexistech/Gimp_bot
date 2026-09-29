@@ -7,7 +7,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 from config import TOKEN
-from plugin_settings import load_root_settings
+from plugin_settings import enabled_plugins, load_root_settings, plugin_folders
 
 PID_FILE = "bot.pid"
 LOG_FILE = "bot.log"
@@ -57,16 +57,14 @@ class StrikeBot(commands.Bot):
             log.error("Plugins directory not found: %s", os.path.abspath(plugins_dir))
             return
 
-        folders = sorted(
-            folder
-            for folder in os.listdir(plugins_dir)
-            if os.path.isdir(os.path.join(plugins_dir, folder))
-            and not folder.startswith("__")
-            and os.path.isfile(os.path.join(plugins_dir, folder, "cog.py"))
-        )
+        folders = plugin_folders()
+        enabled = enabled_plugins()
+        skipped = [folder for folder in folders if folder not in enabled]
         log.info("Found plugin folders with cog.py: %s", ", ".join(folders) or "(none)")
+        if skipped:
+            log.info("Skipping disabled plugins: %s", ", ".join(skipped))
 
-        for folder in folders:
+        for folder in enabled:
             extension_path = f"plugins.{folder}.cog"
             try:
                 await self.load_extension(extension_path)
@@ -76,6 +74,40 @@ class StrikeBot(commands.Bot):
 
         loaded = ", ".join(sorted(self.cogs.keys())) or "(none)"
         log.info("Cogs now loaded: %s", loaded)
+
+    async def apply_plugin_enabled(self, enabled):
+        enabled = set(enabled)
+        results = []
+        for folder in plugin_folders():
+            extension = f"plugins.{folder}.cog"
+            should = folder in enabled
+            loaded = extension in self.extensions
+            if should and loaded:
+                continue
+            if should and not loaded:
+                try:
+                    await self.load_extension(extension)
+                    results.append(f"loaded {folder}")
+                    log.info("Enabled plugin: %s", folder)
+                except Exception as exc:
+                    results.append(f"failed to load {folder}: {exc}")
+                    log.exception("Failed to load plugin %s", folder)
+            if not should and loaded:
+                if folder == "web_config":
+                    results.append("web_config disabled; unload after this request")
+                    continue
+                try:
+                    await self.unload_extension(extension)
+                    results.append(f"unloaded {folder}")
+                    log.info("Disabled plugin: %s", folder)
+                except Exception as exc:
+                    results.append(f"failed to unload {folder}: {exc}")
+                    log.exception("Failed to unload plugin %s", folder)
+        try:
+            await self.sync_guild_commands()
+        except Exception:
+            log.exception("Command sync after plugin toggle failed")
+        return results
 
     async def sync_guild_commands(self):
         guild_id = int(load_root_settings().get("DEV_GUILD_ID") or 0)
