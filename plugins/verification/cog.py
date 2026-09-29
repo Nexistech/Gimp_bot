@@ -391,9 +391,26 @@ class Verification(commands.Cog):
         <form method="post" action="/plugin/__PLUGIN__/action">
           <input type="hidden" name="action" value="set_rank_roles">
           <label>Faction rank</label>
-          <input name="position" placeholder="Talent">
-          <label>Discord role names (comma-separated, empty = none)</label>
-          <input name="roles" placeholder="Talent, Faction Member">
+          <div class="member-picker" data-field="position">
+            <input type="hidden" name="position" id="position" value="">
+            <div class="chips" id="chips-position"></div>
+            <div class="search-wrap">
+              <input type="text" class="member-search" data-field="position" data-source="ranks" data-mode="single"
+                     placeholder="Search faction ranks" autocomplete="off">
+              <div class="suggest" id="suggest-position"></div>
+            </div>
+          </div>
+          <label>Discord roles</label>
+          <div class="member-picker" data-field="roles">
+            <input type="hidden" name="roles" id="roles" value="">
+            <div class="chips" id="chips-roles"></div>
+            <div class="search-wrap">
+              <input type="text" class="member-search" data-field="roles" data-source="rolenames" data-mode="multi"
+                     placeholder="Search Discord roles" autocomplete="off">
+              <div class="suggest" id="suggest-roles"></div>
+            </div>
+          </div>
+          <p class="help">Pick a rank, add one or more Discord roles, then save. Saving a rank with no roles clears it.</p>
           <button type="submit">Save rank mapping</button>
         </form>
         """

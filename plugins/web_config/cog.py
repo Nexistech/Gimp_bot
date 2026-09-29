@@ -480,7 +480,10 @@ class WebConfig(commands.Cog):
                 const q = input.value.trim();
                 if (!q) {{ box.style.display = "none"; box.innerHTML = ""; return; }}
                 timer = setTimeout(async () => {{
-                  const url = source === "roles" ? "/api/roles?q=" : source === "channels" ? "/api/channels?q=" : "/api/roster?q=";
+                  const url = source === "roles" || source === "rolenames" ? (source === "rolenames" ? "/api/role-names?q=" : "/api/roles?q=")
+                    : source === "ranks" ? "/api/ranks?q="
+                    : source === "channels" ? "/api/channels?q="
+                    : "/api/roster?q=";
                   const res = await fetch(url + encodeURIComponent(q));
                   const rows = await res.json();
                   if (!rows.length) {{
@@ -489,8 +492,8 @@ class WebConfig(commands.Cog):
                     return;
                   }}
                   box.innerHTML = rows.map((row) => {{
-                    const label = source === "roles" ? row.name : (row.name + " (" + row.id + ")");
-                    const stored = source === "roles" ? row.name : String(row.id);
+                    const label = (source === "roles" || source === "rolenames" || source === "ranks") ? row.name : (row.name + " (" + row.id + ")");
+                    const stored = (source === "roles" || source === "rolenames" || source === "ranks") ? row.name : String(row.id);
                     return "<button type='button' data-id='" + stored.replace(/'/g, "&#39;") + "' data-label='" + label.replace(/'/g, "&#39;") + "'>" + label + "</button>";
                   }}).join("");
                   box.style.display = "block";
@@ -624,6 +627,30 @@ class WebConfig(commands.Cog):
         query = request.query.get("q", "")
         return web.json_response(self.search_roles(query))
 
+    async def handle_rank_search(self, request):
+        if not self.authorized(request):
+            raise web.HTTPFound("/login")
+        query = (request.query.get("q") or "").strip().lower()
+        roster = self.roster()
+        names = {"Recruit", "Member", "Fluffer", "Talent", "Freeloader"}
+        if roster:
+            for member in roster.all_members():
+                pos = str(member.get("position") or "").strip()
+                if pos:
+                    names.add(pos)
+        rows = [{"id": name, "name": name} for name in sorted(names, key=str.lower)]
+        if query:
+            rows = [row for row in rows if query in row["name"].lower()]
+        return web.json_response(rows[:20])
+
+    async def handle_role_name_search(self, request):
+        if not self.authorized(request):
+            raise web.HTTPFound("/login")
+        rows = []
+        for role in self.search_roles(request.query.get("q", ""), limit=20):
+            rows.append({"id": role["name"], "name": role["name"]})
+        return web.json_response(rows)
+
     async def handle_channel_search(self, request):
         if not self.authorized(request):
             raise web.HTTPFound("/login")
@@ -716,6 +743,8 @@ class WebConfig(commands.Cog):
                 web.get("/api/roster", self.handle_roster_search),
                 web.get("/api/roles", self.handle_role_search),
                 web.get("/api/channels", self.handle_channel_search),
+                web.get("/api/ranks", self.handle_rank_search),
+                web.get("/api/role-names", self.handle_role_name_search),
             ]
         )
         host = str(self.settings.get("WEB_HOST") or "127.0.0.1")
