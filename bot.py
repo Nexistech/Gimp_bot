@@ -147,7 +147,11 @@ async def reload(interaction: discord.Interaction):
 async def reboot(interaction: discord.Interaction):
     if not await bot.is_owner(interaction.user):
         return await interaction.response.send_message("You are not the owner.", ephemeral=True)
-    await interaction.response.send_message("Rebooting bot...", ephemeral=True)
+    if not interaction.response.is_done():
+        try:
+            await interaction.response.send_message("Rebooting bot...", ephemeral=True)
+        except discord.HTTPException:
+            pass
     log.info("Reboot requested by %s", interaction.user)
     remove_pid_file()
     os.execl(sys.executable, sys.executable, *sys.argv)
