@@ -19,7 +19,6 @@ except ImportError:
 
 PLUGIN_DIR = os.path.dirname(__file__)
 DB_NAME = os.path.join(PLUGIN_DIR, "banking.db")
-GIVE_URL = "https://www.torn.com/factions.php?step=your#/tab=controls&option=give-to-user"
 
 
 def utc_now():
@@ -66,18 +65,29 @@ def parse_timeout(text):
 
 
 class WithdrawView(ui.View):
-    def __init__(self, cog, request_id, give_url):
+    def __init__(self, cog, row):
         super().__init__(timeout=None)
         self.cog = cog
-        self.request_id = request_id
-        self.add_item(ui.Button(label="Fulfill in Torn", style=discord.ButtonStyle.link, url=give_url))
+        self.request_id = row["id"]
+        claim = ui.Button(
+            label="Claim / fulfill",
+            style=discord.ButtonStyle.green,
+            custom_id=f"banking:claim:{row['id']}",
+        )
+        claim.callback = self.mark_fulfilling
+        self.add_item(claim)
+        cancel = ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.red,
+            custom_id=f"banking:cancel:{row['id']}",
+        )
+        cancel.callback = self.cancel
+        self.add_item(cancel)
 
-    @ui.button(label="Mark fulfilling", style=discord.ButtonStyle.green, custom_id="banking:fulfilling")
-    async def mark_fulfilling(self, interaction: discord.Interaction, button: ui.Button):
+    async def mark_fulfilling(self, interaction: discord.Interaction):
         await self.cog.mark_fulfilling(interaction, self.request_id)
 
-    @ui.button(label="Cancel", style=discord.ButtonStyle.red, custom_id="banking:cancel")
-    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
+    async def cancel(self, interaction: discord.Interaction):
         await self.cog.cancel_request(interaction, self.request_id)
 
 
@@ -89,7 +99,7 @@ class WithdrawAllView(ui.View):
 
     @ui.button(label="Withdraw all", style=discord.ButtonStyle.primary)
     async def withdraw_all(self, interaction: discord.Interaction, button: ui.Button):
-        await self.cog.create_request(interaction, "all", self.timeout_text, ephemeral=True)
+        await self.cog.create_request(interaction, "all", self.timeout_text)
 
 
 class Banking(commands.Cog):
@@ -122,6 +132,7 @@ class Banking(commands.Cog):
         self.bot = bot
         self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.initialize_db()
+        print("[Banking] Loaded banking cog build claim-edit-v2 (no public Torn link, edit-on-claim)")
         self.watch_task.start()
 
     def reload_settings(self, data=None):
@@ -167,6 +178,10 @@ class Banking(commands.Cog):
             return True
         return any(role.name == role_name for role in getattr(member, "roles", []))
 
+    def has_banker_power(self, member):
+        names = set(self.settings.get("ping_roles") or [])
+        return any(role.name in names for role in getattr(member, "roles", []))
+
     def resolve_torn_member(self, discord_user):
         roster = self.get_roster()
         if not roster:
@@ -191,9 +206,7 @@ class Banking(commands.Cog):
 
     async def vault_balance(self, torn_id):
         donations = await self.fetch_donations()
-        entry = donations.get(str(torn_id)) or donations.get(int(torn_id)) if False else donations.get(str(torn_id))
-        if not entry:
-            return 0
+        entry = donations.get(str(torn_id)) or {}
         return int(entry.get("money_balance") or 0)
 
     async def fetch_funds_news(self):
@@ -207,8 +220,8 @@ class Banking(commands.Cog):
 
     def give_url(self, torn_id, amount):
         return (
-            f"{GIVE_URL}&userID={int(torn_id)}&userId={int(torn_id)}"
-            f"&XID={int(torn_id)}&money={int(amount)}"
+            "https://www.torn.com/factions.php?step=your"
+            f"#/tab=controls&option=give-to-user&giveMoneyTo={int(torn_id)}&money={int(amount)}"
         )
 
     def request_embed(self, row, extra=None):
@@ -224,10 +237,7 @@ class Banking(commands.Cog):
         who = row["torn_name"] or f"Torn {row['torn_id']}"
         embed = discord.Embed(
             title=f"Vault withdraw #{row['id']}",
-            description=(
-                f"<@{row['discord_id']}> (**[{who}]({profile})** `{row['torn_id']}`) "
-                f"requested **{format_money(row['amount'])}**."
-            ),
+            description=f"**[{who}]({profile})** `{row['torn_id']}` requested **{format_money(row['amount'])}**.",
             color=color,
             timestamp=utc_now(),
         )
@@ -235,7 +245,7 @@ class Banking(commands.Cog):
         embed.add_field(name="Amount", value=format_money(row["amount"]), inline=True)
         embed.add_field(name="Status", value=status.replace("_", " ").title(), inline=True)
         if row["expires_at"]:
-            embed.add_field(name="Expires", value=row["expires_at"], inline=False)
+            embed.add_field(name="Expires", value=str(row["expires_at"])[:16].replace("T", " ") + " UTC", inline=False)
         else:
             embed.add_field(name="Expires", value="Never", inline=False)
         if extra:
@@ -243,26 +253,41 @@ class Banking(commands.Cog):
         return embed
 
     def view_for(self, row):
-        if row["status"] not in {"open", "fulfilling"}:
+        if row["status"] != "open":
             return None
-        return WithdrawView(self, row["id"], self.give_url(row["torn_id"], row["amount"]))
+        return WithdrawView(self, row)
 
-    async def update_message(self, row, extra=None):
+    async def update_message(self, row, extra=None, interaction=None):
+        embed = self.request_embed(row, extra)
+        view = self.view_for(row)
+        if interaction and interaction.message:
+            try:
+                if interaction.response.is_done():
+                    await interaction.message.edit(embed=embed, view=view)
+                else:
+                    await interaction.response.edit_message(embed=embed, view=view)
+                return
+            except discord.HTTPException as exc:
+                print(f"[Banking] Could not edit via interaction #{row['id']}: {exc}")
         channel = self.bot.get_channel(row["channel_id"]) if row["channel_id"] else None
         if not channel or not row["message_id"]:
             return
         try:
             message = await channel.fetch_message(row["message_id"])
-            await message.edit(embed=self.request_embed(row, extra), view=self.view_for(row))
+            await message.edit(embed=embed, view=view)
+        except discord.HTTPException as exc:
+            print(f"[Banking] Could not edit request #{row['id']}: {exc}")
+
+    async def acknowledge(self, interaction):
+        if interaction.response.is_done():
+            return
+        try:
+            await interaction.response.defer(ephemeral=True)
         except discord.HTTPException:
             pass
 
     async def create_request(self, interaction: discord.Interaction, amount_text, timeout_text, ephemeral=False):
-        if not interaction.response.is_done():
-            try:
-                await interaction.response.defer(ephemeral=True)
-            except discord.NotFound:
-                pass
+        await self.acknowledge(interaction)
         if not self.has_verified_role(interaction.user):
             return await interaction.followup.send(
                 f"You need the **{self.settings.get('verified_role') or 'Verified'}** role to withdraw.",
@@ -271,7 +296,7 @@ class Banking(commands.Cog):
         member = self.resolve_torn_member(interaction.user)
         if not member:
             return await interaction.followup.send(
-                "I can't match your Discord account to a faction member. Verify / wait for a Discord ID backfill.",
+                "I can't match your Discord account to a faction member.",
                 ephemeral=True,
             )
         torn_id = int(member.get("id") or member.get("user_id"))
@@ -301,14 +326,7 @@ class Banking(commands.Cog):
                 torn_id, torn_name, discord_id, amount, status, created_at, expires_at
             ) VALUES (?, ?, ?, ?, 'open', ?, ?)
             """,
-            (
-                torn_id,
-                member.get("name"),
-                interaction.user.id,
-                amount,
-                utc_now().isoformat(),
-                expires_at,
-            ),
+            (torn_id, member.get("name"), interaction.user.id, amount, utc_now().isoformat(), expires_at),
         )
         request_id = cur.lastrowid
         conn.commit()
@@ -324,16 +342,15 @@ class Banking(commands.Cog):
                 role = discord.utils.get(channel.guild.roles, name=role_name)
                 if role:
                     mentions.append(role.mention)
+        who = row["torn_name"] or f"Torn {row['torn_id']}"
+        prefix = (" ".join(mentions) + "\n") if mentions else ""
+        summary = f"{prefix}**{who} [{row['torn_id']}]** requested **{format_money(row['amount'])}**"
         try:
-            message = await channel.send(
-                content=" ".join(mentions) if mentions else None,
-                embed=self.request_embed(row),
-                view=self.view_for(row),
-            )
+            message = await channel.send(content=summary, embed=self.request_embed(row), view=self.view_for(row))
         except discord.Forbidden:
             return await interaction.followup.send(
                 f"I don't have access to post in <#{channel.id}>. "
-                "Give the bot View Channel + Send Messages + Embed Links there, or pick another banking channel.",
+                "Give the bot View Channel + Send Messages + Embed Links there.",
                 ephemeral=True,
             )
         conn = self.db()
@@ -353,7 +370,9 @@ class Banking(commands.Cog):
         row = conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
         if not row or row["status"] not in {"open", "fulfilling"}:
             conn.close()
-            return await interaction.response.send_message("That request is no longer active.", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("That request is no longer active.", ephemeral=True)
+            return
         conn.execute(
             "UPDATE requests SET status = 'fulfilling', fulfiller_discord_id = ?, fulfilling_at = ? WHERE id = ?",
             (interaction.user.id, utc_now().isoformat(), request_id),
@@ -361,33 +380,44 @@ class Banking(commands.Cog):
         conn.commit()
         row = conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
         conn.close()
-        await interaction.response.send_message(
-            f"Marked #{request_id} as in progress. Open **Fulfill in Torn** and send the money. "
-            "I will check the vault log in 10 minutes.",
-            ephemeral=True,
-        )
-        await self.update_message(row, extra=f"In progress by <@{interaction.user.id}>")
+        extra = f"In progress by <@{interaction.user.id}>"
+        try:
+            await interaction.response.edit_message(embed=self.request_embed(row, extra), view=None)
+        except discord.HTTPException as exc:
+            print(f"[Banking] Claim edit failed #{request_id}: {exc}")
+            await self.update_message(row, extra=extra)
+        try:
+            await interaction.followup.send(
+                f"You claimed #{request_id}. Send the money in Torn. I check the vault each minute for 10 minutes.\n"
+                f"[Open Give to User]({self.give_url(row['torn_id'], row['amount'])})",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            pass
 
     async def cancel_request(self, interaction: discord.Interaction, request_id):
         conn = self.db()
         row = conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
         if not row:
             conn.close()
-            return await interaction.response.send_message("Request not found.", ephemeral=True)
-        if interaction.user.id not in {row["discord_id"], row["fulfiller_discord_id"]} and not self.has_banker_power(interaction.user):
-            if str(interaction.user.id) != str(row["discord_id"]):
-                conn.close()
-                return await interaction.response.send_message("Only the requester or a banker can cancel this.", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Request not found.", ephemeral=True)
+            return
+        allowed = {row["discord_id"], row["fulfiller_discord_id"]}
+        if interaction.user.id not in allowed and not self.has_banker_power(interaction.user):
+            conn.close()
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Only the requester or a banker can cancel this.", ephemeral=True)
+            return
         conn.execute("UPDATE requests SET status = 'cancelled' WHERE id = ?", (request_id,))
         conn.commit()
         row = conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
         conn.close()
-        await interaction.response.send_message(f"Cancelled request #{request_id}.", ephemeral=True)
-        await self.update_message(row, extra=f"Cancelled by <@{interaction.user.id}>")
-
-    def has_banker_power(self, member):
-        names = set(self.settings.get("ping_roles") or [])
-        return any(role.name in names for role in getattr(member, "roles", []))
+        extra = f"Cancelled by <@{interaction.user.id}>"
+        try:
+            await interaction.response.edit_message(embed=self.request_embed(row, extra), view=None)
+        except discord.HTTPException:
+            await self.update_message(row, extra=extra, interaction=interaction)
 
     async def confirm_paid(self, row):
         try:
@@ -397,14 +427,13 @@ class Banking(commands.Cog):
             return False
         amount = int(row["amount"])
         torn_id = str(row["torn_id"])
-        name = str(row["torn_name"] or "")
+        name = str(row["torn_name"] or "").lower()
         items = news.values() if isinstance(news, dict) else news
         for item in items:
             text = str(item.get("news") or item.get("text") or item).lower()
-            if torn_id in text or name.lower() in text:
+            if torn_id in text or name in text:
                 if str(amount) in text.replace(",", "") or format_money(amount).lower() in text:
                     return True
-        # Fallback: balance dropped by about the requested amount.
         try:
             balance = await self.vault_balance(row["torn_id"])
             if balance + 1 < amount:
@@ -435,15 +464,15 @@ class Banking(commands.Cog):
                         continue
                 except ValueError:
                     pass
-            if row["status"] == "fulfilling" and row["fulfilling_at"]:
-                try:
-                    started = datetime.datetime.fromisoformat(row["fulfilling_at"])
-                    if started.tzinfo is None:
-                        started = started.replace(tzinfo=datetime.timezone.utc)
-                except ValueError:
-                    continue
-                if now < started + datetime.timedelta(minutes=10):
-                    continue
+            if row["status"] != "fulfilling" or not row["fulfilling_at"]:
+                continue
+            try:
+                started = datetime.datetime.fromisoformat(row["fulfilling_at"])
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                continue
+            if now < started + datetime.timedelta(minutes=10):
                 if await self.confirm_paid(row):
                     conn = self.db()
                     conn.execute("UPDATE requests SET status = 'paid' WHERE id = ?", (row["id"],))
@@ -452,25 +481,31 @@ class Banking(commands.Cog):
                     conn.close()
                     who = f"<@{row['fulfiller_discord_id']}>" if row["fulfiller_discord_id"] else "a banker"
                     await self.update_message(updated, extra=f"Paid by {who}.")
-                else:
-                    conn = self.db()
-                    conn.execute("UPDATE requests SET status = 'open', fulfilling_at = NULL WHERE id = ?", (row["id"],))
-                    conn.commit()
-                    updated = conn.execute("SELECT * FROM requests WHERE id = ?", (row["id"],)).fetchone()
-                    conn.close()
-                    extra = "Vault log did not show the payout. Request is open again."
-                    await self.update_message(updated, extra=extra)
-                    channel = self.bot.get_channel(updated["channel_id"]) if updated["channel_id"] else None
-                    if channel and channel.guild:
-                        mentions = []
-                        for role_name in self.settings.get("ping_roles") or []:
-                            role = discord.utils.get(channel.guild.roles, name=role_name)
-                            if role:
-                                mentions.append(role.mention)
-                        if mentions:
-                            await channel.send(
-                                f"{' '.join(mentions)} withdraw #{updated['id']} still needs to be paid."
-                            )
+                continue
+            if await self.confirm_paid(row):
+                conn = self.db()
+                conn.execute("UPDATE requests SET status = 'paid' WHERE id = ?", (row["id"],))
+                conn.commit()
+                updated = conn.execute("SELECT * FROM requests WHERE id = ?", (row["id"],)).fetchone()
+                conn.close()
+                who = f"<@{row['fulfiller_discord_id']}>" if row["fulfiller_discord_id"] else "a banker"
+                await self.update_message(updated, extra=f"Paid by {who}.")
+            else:
+                conn = self.db()
+                conn.execute("UPDATE requests SET status = 'open', fulfilling_at = NULL WHERE id = ?", (row["id"],))
+                conn.commit()
+                updated = conn.execute("SELECT * FROM requests WHERE id = ?", (row["id"],)).fetchone()
+                conn.close()
+                await self.update_message(updated, extra="Vault log did not show the payout. Request is open again.")
+                channel = self.bot.get_channel(updated["channel_id"]) if updated["channel_id"] else None
+                if channel and channel.guild:
+                    mentions = []
+                    for role_name in self.settings.get("ping_roles") or []:
+                        role = discord.utils.get(channel.guild.roles, name=role_name)
+                        if role:
+                            mentions.append(role.mention)
+                    if mentions:
+                        await channel.send(f"{' '.join(mentions)} withdraw #{updated['id']} still needs to be paid.")
 
     @watch_task.before_loop
     async def before_watch(self):
@@ -479,14 +514,11 @@ class Banking(commands.Cog):
     @app_commands.command(name="withdraw", description="Request money from the faction vault.")
     @app_commands.describe(amount="Amount such as 1,000,000, 1m, 250k, or all", timeout="30m, 60m, 1:30, 4h, or never")
     async def withdraw_command(self, interaction: discord.Interaction, amount: str, timeout: str = None):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
         await self.create_request(interaction, amount, timeout)
 
     @app_commands.command(name="balance", description="Show your faction vault balance.")
     async def balance_command(self, interaction: discord.Interaction):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True)
+        await self.acknowledge(interaction)
         if not self.has_verified_role(interaction.user):
             return await interaction.followup.send("You need the verified role to check vault balance.", ephemeral=True)
         member = self.resolve_torn_member(interaction.user)
