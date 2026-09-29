@@ -588,23 +588,34 @@ class Verification(commands.Cog):
             torn = await self.lookup_torn_from_discord(member.id)
             if torn and torn.get("in_faction"):
                 plan = await self.apply_verified(member, torn)
-                reports.append(self.describe_plan(member, torn, plan, "in-faction"))
+                kind = "in-faction"
             elif torn:
                 plan = await self.apply_torn_user_only(member, torn)
-                reports.append(self.describe_plan(member, torn, plan, "torn-linked"))
+                kind = "torn-linked"
             else:
                 plan = await self.mark_unverified(member, "verifyall: not Torn-linked")
-                if plan and (plan["add"] or plan["remove"]):
-                    fake = {"name": "?", "id": "?", "position": ""}
-                    reports.append(self.describe_plan(member, fake, {**plan, "recruit": False}, "unverified"))
+                torn = {"name": "?", "id": "?", "position": ""}
+                kind = "unverified"
+            if plan and (plan.get("add") or plan.get("remove") or plan.get("nick") or plan.get("recruit")):
+                reports.append(self.describe_plan(member, torn, plan, kind))
             await asyncio.sleep(0.35)
         header = "**DRY RUN — no changes applied.**\n" if self.dry_run() else ""
-        body = header + f"Checked {checked} member(s).\n\n" + "\n\n".join(reports[:25])
-        if len(reports) > 25:
-            body += f"\n\n…and {len(reports) - 25} more."
-        if len(body) > 1900:
-            body = body[:1900] + "…"
-        await interaction.followup.send(body or "Nothing to report.", ephemeral=True)
+        chunks = []
+        current = header + f"Checked {checked} member(s), {len(reports)} with a planned change."
+        for report in reports:
+            piece = "\n\n" + report
+            if len(current) + len(piece) > 1800:
+                chunks.append(current)
+                current = report
+            else:
+                current += piece
+        if current.strip():
+            chunks.append(current)
+        if not chunks:
+            chunks = [header + f"Checked {checked} member(s). Nothing to change."]
+        await interaction.followup.send(chunks[0], ephemeral=True)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=True)
 
     @tasks.loop(time=datetime.time(hour=6, minute=0, tzinfo=datetime.timezone.utc))
     async def daily_task(self):
