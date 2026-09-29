@@ -21,11 +21,17 @@ PLUGIN_DIR = os.path.dirname(__file__)
 DB_NAME = os.path.join(PLUGIN_DIR, "verification.db")
 LOCKOUT_HOURS = 24
 TORN_DISCORD = "https://www.torn.com/discord"
+TORN_OAUTH = (
+    "https://discord.com/api/oauth2/authorize?client_id=439014098987122698"
+    "&redirect_uri=https%3A%2F%2Fwww.torn.com%2Fdiscord.php&response_type=code&scope=identify"
+)
 OFFICIAL_VERIFY_HELP = (
-    "This server does **not** run Torn verification.\n"
-    "Link Discord on the **official Torn Discord**: {torn_discord}\n"
-    "Torn stores that link. We only read it through the public API after you verify there.\n"
-    "There is no OAuth page on this bot and we never see your Torn password or API key."
+    "{mention} may not be verified on Torn. To verify on Torn, the user can link their "
+    "Discord and Torn accounts through the [official Torn Discord server]({torn_discord}) "
+    "or through a [direct OAuth link]({oauth}). Once the user is verified, use `/verify` "
+    "to verify the user.\n\n"
+    "We do **not** control that Discord server or OAuth page. Both are run by Torn's developers. "
+    "This bot only reads the public API after Torn has stored the link."
 )
 
 
@@ -58,7 +64,7 @@ class Verification(commands.Cog):
         {
             "key": "verified_role",
             "type": "str",
-            "label": "Verified Discord role",
+            "label": "Torn-linked Discord role (not faction membership)",
             "default": "Verified",
             "widget": "discord_role",
         },
@@ -79,7 +85,7 @@ class Verification(commands.Cog):
         {
             "key": "admin_role",
             "type": "str",
-            "label": "Admin role that can /verify others, use force, and /verifyall",
+            "label": "Admin role that can /verify others and run /verifyall",
             "default": "",
             "widget": "discord_role",
         },
@@ -254,7 +260,7 @@ class Verification(commands.Cog):
         return (
             f"You already used `/verify` in the last {LOCKOUT_HOURS} hours.\n"
             "After you finish official Torn verification, ask an admin to run "
-            "`/verify member:@you force:True`, or wait for the automated check."
+            "`/verify` on you, or wait for the automated check."
         )
 
     async def lookup_torn_from_discord(self, discord_id):
@@ -407,9 +413,61 @@ class Verification(commands.Cog):
                 pass
         return plan
 
-    def instructions(self):
+    def instructions(self, mention="This user"):
         url = self.settings.get("torn_discord_url") or TORN_DISCORD
-        return OFFICIAL_VERIFY_HELP.format(torn_discord=url)
+        return OFFICIAL_VERIFY_HELP.format(mention=mention, torn_discord=url, oauth=TORN_OAUTH)
+
+    def plan_torn_user_only(self, member, torn):
+        guild = member.guild
+        torn_role = self.role_by_name(guild, self.settings.get("verified_role"))
+        unverified = self.role_by_name(guild, self.settings.get("unverified_role"))
+        mapped = {self.role_by_name(guild, name) for name in self.mapped_role_names()}
+        mapped.discard(None)
+        to_add = []
+        to_remove = []
+        if torn_role and torn_role not in member.roles:
+            to_add.append(torn_role)
+        if unverified and unverified in member.roles:
+            to_remove.append(unverified)
+        for role in member.roles:
+            if role in mapped and role != torn_role and role != unverified and role not in to_remove:
+                to_remove.append(role)
+        nick = None
+        if self.settings.get("set_nickname") and torn.get("name"):
+            wanted = str(torn["name"])[:32]
+            if member.nick != wanted:
+                nick = wanted
+        return {
+            "add": to_add,
+            "remove": to_remove,
+            "nick": nick,
+            "recruit": False,
+            "reason": f"Torn-linked {torn.get('name')} [{torn.get('id')}] (not in faction)",
+        }
+
+    async def apply_torn_user_only(self, member, torn):
+        plan = self.plan_torn_user_only(member, torn)
+        if self.dry_run():
+            return plan
+        if plan["remove"]:
+            try:
+                await member.remove_roles(*plan["remove"], reason=plan["reason"])
+            except discord.HTTPException as exc:
+                print(f"[Verify] remove_roles failed: {exc}")
+        if plan["add"]:
+            try:
+                await member.add_roles(*plan["add"], reason=plan["reason"])
+            except discord.HTTPException as exc:
+                print(f"[Verify] add_roles failed: {exc}")
+        if plan["nick"]:
+            try:
+                await member.edit(nick=plan["nick"], reason=plan["reason"])
+            except discord.HTTPException:
+                pass
+        await self.log(
+            f"Marked {member.mention} as Torn-linked `{torn.get('name')}` [{torn.get('id')}] (not in faction)."
+        )
+        return plan
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
@@ -423,7 +481,12 @@ class Verification(commands.Cog):
             if self.dry_run():
                 await self.log("DRY RUN join:\n" + self.describe_plan(member, torn, plan, "join-verify"))
             return
-        plan = await self.mark_unverified(member, "Joined; not on faction roster")
+        if torn:
+            plan = await self.apply_torn_user_only(member, torn)
+            if self.dry_run():
+                await self.log("DRY RUN join torn-user:\n" + self.describe_plan(member, torn, plan, "torn-linked"))
+            return
+        plan = await self.mark_unverified(member, "Joined; not Torn-linked")
         if self.dry_run() and plan:
             await self.log(
                 "DRY RUN join unverified:\n"
@@ -434,12 +497,7 @@ class Verification(commands.Cog):
             )
         lobby_id = int(self.settings.get("lobby_channel_id") or 0)
         lobby = member.guild.get_channel(lobby_id) if lobby_id else None
-        text = (
-            f"{member.mention} Welcome. You are gated here until Torn verification is visible to the API.\n\n"
-            + self.instructions()
-        )
-        if torn and not torn.get("in_faction"):
-            text += f"\nYour Discord is linked to Torn `{torn.get('name')}` [{torn.get('id')}], but that account is not in this faction."
+        text = self.instructions(member.mention)
         if lobby:
             await lobby.send(text)
         else:
@@ -448,17 +506,9 @@ class Verification(commands.Cog):
             except discord.HTTPException:
                 pass
 
-    @app_commands.command(name="verify", description="Verify yourself against Torn. Admins can verify others with force.")
-    @app_commands.describe(
-        member="Admin only: Discord member to verify",
-        force="Admin only: bypass the 24 hour lockout",
-    )
-    async def verify_command(
-        self,
-        interaction: discord.Interaction,
-        member: discord.Member = None,
-        force: bool = False,
-    ):
+    @app_commands.command(name="verify", description="Verify yourself against Torn. Admins can verify anyone.")
+    @app_commands.describe(member="Admin only: Discord member to verify")
+    async def verify_command(self, interaction: discord.Interaction, member: discord.Member = None):
         actor = interaction.user
         target = member or actor
         admin = self.is_admin(actor)
@@ -467,8 +517,6 @@ class Verification(commands.Cog):
                 "You can only `/verify` yourself. An admin has to verify someone else.",
                 ephemeral=True,
             )
-        if force and not admin:
-            return await interaction.response.send_message("Only admins can use force.", ephemeral=True)
         if not self.is_enabled():
             return await interaction.response.send_message(
                 "Verification is disabled until setup is finished.", ephemeral=True
@@ -478,39 +526,39 @@ class Verification(commands.Cog):
                 "That member is on the verification exclude role.", ephemeral=True
             )
         remaining = self.lock_remaining(target.id)
-        if remaining and not (admin and force):
-            hours = max(1, int(remaining.total_seconds() // 3600))
-            if admin and target.id != actor.id:
-                return await interaction.response.send_message(
-                    f"{target.mention} is locked out for about {hours} more hour(s). "
-                    "Run `/verify member:@them force:True` to override.",
-                    ephemeral=True,
-                )
+        if remaining and not admin:
             return await interaction.response.send_message(self.lockout_message(), ephemeral=True)
         await interaction.response.defer(ephemeral=True)
-        if target.id == actor.id or not (admin and force):
+        if not admin:
             self.record_attempt(target.id, "attempt")
         torn = await self.lookup_torn_from_discord(target.id)
         prefix = "**DRY RUN — no changes applied.**\n" if self.dry_run() else ""
         if not torn:
-            self.record_attempt(target.id, "not_linked")
+            if not admin:
+                self.record_attempt(target.id, "not_linked")
             return await interaction.followup.send(
-                prefix + f"{target.mention} is not linked on Torn yet.\n\n{self.instructions()}",
+                prefix + self.instructions(target.mention),
                 ephemeral=True,
             )
         if not torn.get("in_faction"):
-            plan = await self.mark_unverified(target, "Verified Torn account is not in faction")
-            extra = ""
-            if self.dry_run() and plan:
-                extra = "\n" + self.describe_plan(target, torn, {**plan, "recruit": False}, "not-in-faction")
+            plan = await self.apply_torn_user_only(target, torn)
+            if not admin:
+                self.record_attempt(target.id, "torn_linked")
+            if self.dry_run():
+                return await interaction.followup.send(
+                    prefix
+                    + f"Torn-linked, not in faction. Keeping **{self.settings.get('verified_role') or 'Torn-User'}**.\n"
+                    + self.describe_plan(target, torn, plan, "torn-linked"),
+                    ephemeral=True,
+                )
             return await interaction.followup.send(
-                prefix
-                + f"Torn account `{torn.get('name')}` [{torn.get('id')}] is linked, but they are not in this faction."
-                + extra,
+                f"{target.mention} is Torn-linked as `{torn.get('name')}` [{torn.get('id')}] but not in this faction. "
+                f"Applied **{self.settings.get('verified_role') or 'Torn-User'}**.",
                 ephemeral=True,
             )
         plan = await self.apply_verified(target, torn)
-        self.record_attempt(target.id, "verified")
+        if not admin:
+            self.record_attempt(target.id, "verified")
         if self.dry_run():
             return await interaction.followup.send(
                 prefix + self.describe_plan(target, torn, plan),
@@ -541,11 +589,14 @@ class Verification(commands.Cog):
             if torn and torn.get("in_faction"):
                 plan = await self.apply_verified(member, torn)
                 reports.append(self.describe_plan(member, torn, plan, "in-faction"))
+            elif torn:
+                plan = await self.apply_torn_user_only(member, torn)
+                reports.append(self.describe_plan(member, torn, plan, "torn-linked"))
             else:
-                plan = await self.mark_unverified(member, "verifyall: not in faction")
+                plan = await self.mark_unverified(member, "verifyall: not Torn-linked")
                 if plan and (plan["add"] or plan["remove"]):
-                    fake = torn or {"name": "?", "id": "?", "position": ""}
-                    reports.append(self.describe_plan(member, fake, {**plan, "recruit": False}, "strip"))
+                    fake = {"name": "?", "id": "?", "position": ""}
+                    reports.append(self.describe_plan(member, fake, {**plan, "recruit": False}, "unverified"))
             await asyncio.sleep(0.35)
         header = "**DRY RUN — no changes applied.**\n" if self.dry_run() else ""
         body = header + f"Checked {checked} member(s).\n\n" + "\n\n".join(reports[:25])
@@ -573,7 +624,11 @@ class Verification(commands.Cog):
                 continue
             if member.id in in_faction:
                 continue
-            await self.mark_unverified(member, "Daily check: not on faction roster")
+            torn = await self.lookup_torn_from_discord(member.id)
+            if torn:
+                await self.apply_torn_user_only(member, torn)
+            else:
+                await self.mark_unverified(member, "Daily check: not Torn-linked")
             await asyncio.sleep(0.4)
 
     @daily_task.before_loop
