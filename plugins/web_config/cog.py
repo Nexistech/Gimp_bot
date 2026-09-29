@@ -1,3 +1,4 @@
+import asyncio
 import html
 import hmac
 import json
@@ -104,6 +105,13 @@ class WebConfig(commands.Cog):
         self.runner = None
         self.session_token = secrets.token_hex(16)
         self.settings = load_root_settings()
+
+    async def cog_load(self):
+        await asyncio.sleep(0.3)
+        try:
+            await self.start_site()
+        except Exception as exc:
+            print(f"[WebConfig] Failed to start: {exc}")
 
     def cog_unload(self):
         if self.bot.loop.is_running():
@@ -752,15 +760,27 @@ class WebConfig(commands.Cog):
         access_logger = setup_web_logging()
         self.runner = web.AppRunner(app, access_log=access_logger)
         await self.runner.setup()
-        self.site = web.TCPSite(self.runner, host, port)
-        await self.site.start()
+        last_error = None
+        for attempt in range(6):
+            try:
+                self.site = web.TCPSite(self.runner, host, port)
+                await self.site.start()
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+                await asyncio.sleep(0.4)
+        if last_error:
+            raise last_error
         print(f"[WebConfig] Config UI on http://{host}:{port}")
 
     async def stop_site(self):
         if self.site:
             await self.site.stop()
+            self.site = None
         if self.runner:
             await self.runner.cleanup()
+            self.runner = None
 
     @commands.Cog.listener()
     async def on_ready(self):
