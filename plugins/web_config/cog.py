@@ -1,9 +1,11 @@
 import html
 import hmac
 import json
+import logging
 import os
 import secrets
 import sys
+from logging.handlers import RotatingFileHandler
 
 import aiohttp
 from aiohttp import web
@@ -21,6 +23,25 @@ from plugin_settings import (
 
 PLUGIN_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.getcwd()
+WEB_LOG_FILE = os.path.join(PLUGIN_DIR, "web_config.log")
+
+
+def setup_web_logging():
+    logger = logging.getLogger("aiohttp.access")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = RotatingFileHandler(WEB_LOG_FILE, maxBytes=500_000, backupCount=3)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logger.addHandler(handler)
+    server = logging.getLogger("aiohttp.server")
+    server.setLevel(logging.WARNING)
+    server.propagate = False
+    if not server.handlers:
+        handler = RotatingFileHandler(WEB_LOG_FILE, maxBytes=500_000, backupCount=3)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        server.addHandler(handler)
+    return logger
 
 PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -563,7 +584,8 @@ class WebConfig(commands.Cog):
         )
         host = str(self.settings.get("WEB_HOST") or "127.0.0.1")
         port = int(self.settings.get("WEB_PORT") or 8080)
-        self.runner = web.AppRunner(app)
+        access_logger = setup_web_logging()
+        self.runner = web.AppRunner(app, access_log=access_logger)
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, host, port)
         await self.site.start()
