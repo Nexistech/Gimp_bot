@@ -53,7 +53,9 @@ class OCToolsMonitor(commands.Cog):
         self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.item_names = {}
         self.initialize_db()
+        self.load_item_names()
         self.check_task.start()
+        self.refresh_items_task.start()
 
     def reload_settings(self, data=None):
         self.settings = data or load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
@@ -62,6 +64,7 @@ class OCToolsMonitor(commands.Cog):
 
     def cog_unload(self):
         self.check_task.cancel()
+        self.refresh_items_task.cancel()
 
     def get_roster(self):
         return self.bot.get_cog("FactionRoster")
@@ -79,8 +82,34 @@ class OCToolsMonitor(commands.Cog):
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS torn_items (
+                item_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
         conn.close()
+
+    def load_item_names(self):
+        conn = sqlite3.connect(DB_NAME)
+        rows = conn.execute("SELECT item_id, name FROM torn_items").fetchall()
+        conn.close()
+        self.item_names = {int(item_id): name for item_id, name in rows}
+
+    def store_item_names(self, mapping):
+        now = utc_now().isoformat()
+        conn = sqlite3.connect(DB_NAME)
+        conn.executemany(
+            "INSERT OR REPLACE INTO torn_items (item_id, name, updated_at) VALUES (?, ?, ?)",
+            [(int(item_id), name, now) for item_id, name in mapping.items()],
+        )
+        conn.commit()
+        conn.close()
+        self.item_names.update(mapping)
 
     def already_alerted(self, crime_id, user_id, item_id):
         conn = sqlite3.connect(DB_NAME)
@@ -103,30 +132,46 @@ class OCToolsMonitor(commands.Cog):
         conn.commit()
         conn.close()
 
-    async def ensure_item_names(self, needed_ids):
-        missing = [item_id for item_id in needed_ids if item_id not in self.item_names]
-        if not missing or not TORN_API_KEY:
+    async def refresh_item_catalog(self):
+        if not TORN_API_KEY:
             return
-        url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}"
+        url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}&comment=StrikeBot"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=20) as response:
+            async with aiohttp.ClientSession(headers={"User-Agent": "StrikeBot/1.0"}) as session:
+                async with session.get(url, timeout=30) as response:
                     response.raise_for_status()
                     data = await response.json()
-            items = data.get("items") or {}
-            for raw_id, info in items.items():
-                try:
-                    self.item_names[int(raw_id)] = info.get("name") or f"Item {raw_id}"
-                except (TypeError, ValueError):
-                    continue
         except Exception as exc:
             print(f"[OC Tools] Item catalog fetch failed: {exc}")
+            return
+        if data.get("error"):
+            print(f"[OC Tools] Item catalog API error: {data['error']}")
+            return
+        items = data.get("items") or {}
+        mapping = {}
+        for raw_id, info in items.items():
+            try:
+                item_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            name = (info or {}).get("name") if isinstance(info, dict) else None
+            if name:
+                mapping[item_id] = name
+        if mapping:
+            self.store_item_names(mapping)
+            print(f"[OC Tools] Cached {len(mapping)} item names.")
+
+    async def ensure_item_names(self, needed_ids):
+        if any(int(item_id) not in self.item_names for item_id in needed_ids):
+            if not self.item_names:
+                await self.refresh_item_catalog()
+
+    def item_name(self, item_id):
+        return self.item_names.get(int(item_id or 0)) or "unknown item"
 
     def item_label(self, req):
         item_id = req.get("id")
-        name = req.get("name") or self.item_names.get(int(item_id) if item_id else 0)
-        if not name:
-            name = f"Item {item_id}" if item_id else "Unknown item"
+        name = req.get("name") or self.item_name(item_id)
         kind = "reusable tool" if req.get("is_reusable") else "consumable"
         return name, kind, item_id
 
@@ -152,9 +197,9 @@ class OCToolsMonitor(commands.Cog):
             crime_id = crime.get("id")
             crime_name = crime.get("name") or "Organized crime"
             for slot in crime.get("slots") or []:
-                user = slot.get("user") or {}
+                user = slot.get("user")
                 req = slot.get("item_requirement") or slot.get("required_item")
-                if not user or not req:
+                if not isinstance(user, dict) or not user.get("id") or not req:
                     continue
                 available = req.get("is_available")
                 if available is not False and str(available).lower() not in {"false", "0"}:
@@ -243,6 +288,16 @@ class OCToolsMonitor(commands.Cog):
             name, kind, _item_id = self.item_label(entry["req"])
             if await self.post_alert(entry, name, kind):
                 self.record_alert(entry["crime_id"], entry["user_id"], entry["item_id"])
+
+    @tasks.loop(hours=24 * 7)
+    async def refresh_items_task(self):
+        await self.refresh_item_catalog()
+
+    @refresh_items_task.before_loop
+    async def before_refresh_items(self):
+        await self.bot.wait_until_ready()
+        if not self.item_names:
+            await self.refresh_item_catalog()
 
     @check_task.before_loop
     async def before_check(self):
