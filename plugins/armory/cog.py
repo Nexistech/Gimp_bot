@@ -113,9 +113,9 @@ class ArmoryTracker(commands.Cog):
             raise RuntimeError("TORN_API_KEY missing")
         url = (
             f"https://api.torn.com/faction/?selections={SELECTIONS}"
-            f"&key={TORN_API_KEY}&comment=StrikeBot"
+            f"&key={TORN_API_KEY}&comment=GimpBot"
         )
-        headers = {"User-Agent": "StrikeBot/1.0"}
+        headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=30) as response:
                 response.raise_for_status()

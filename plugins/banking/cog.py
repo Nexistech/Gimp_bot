@@ -194,8 +194,8 @@ class Banking(commands.Cog):
     async def fetch_donations(self):
         if not TORN_API_KEY:
             raise RuntimeError("TORN_API_KEY missing")
-        url = f"https://api.torn.com/faction/?selections=donations&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
+        url = f"https://api.torn.com/faction/?selections=donations&key={TORN_API_KEY}&comment=GimpBot"
+        headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=20) as response:
                 response.raise_for_status()
@@ -210,8 +210,8 @@ class Banking(commands.Cog):
         return int(entry.get("money_balance") or 0)
 
     async def fetch_funds_news(self):
-        url = f"https://api.torn.com/faction/?selections=fundsnews&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
+        url = f"https://api.torn.com/faction/?selections=fundsnews&key={TORN_API_KEY}&comment=GimpBot"
+        headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=20) as response:
                 response.raise_for_status()

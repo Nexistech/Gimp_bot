@@ -26,7 +26,7 @@ def setup_logging():
 
     logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("discord.http").setLevel(logging.WARNING)
-    return logging.getLogger("StrikeBot")
+    return logging.getLogger("GimpBot")
 
 
 log = setup_logging()
@@ -47,7 +47,7 @@ def remove_pid_file():
 atexit.register(remove_pid_file)
 
 
-class StrikeBot(commands.Bot):
+class GimpBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
 
@@ -135,7 +135,7 @@ class StrikeBot(commands.Bot):
             log.exception("Command sync failed")
 
 
-bot = StrikeBot()
+bot = GimpBot()
 
 
 @bot.tree.command(name="reload", description="Reload all plugins without restarting.")

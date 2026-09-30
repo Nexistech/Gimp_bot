@@ -51,7 +51,7 @@ PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strike bot config</title>
+<title>Gimp Bot config</title>
 <style>
 :root { color-scheme: dark; }
 body { margin:0; font-family: system-ui, sans-serif; background:#101218; color:#e8eaed; }
@@ -198,7 +198,7 @@ class WebConfig(commands.Cog):
                 continue
             cls = "active" if item["id"] == active else ""
             links.append(f'<a class="{cls}" href="/plugin/{item["id"]}">{item["label"]}</a>')
-        return "<nav><h1>Strike bot</h1>" + "".join(links) + "</nav>"
+        return "<nav><h1>Gimp Bot</h1>" + "".join(links) + "</nav>"
 
     def roster(self):
         return self.bot.get_cog("FactionRoster")

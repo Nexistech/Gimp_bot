@@ -130,8 +130,8 @@ class ChainAlert(commands.Cog):
     async def fetch_chain(self):
         if not TORN_API_KEY:
             return None
-        url = f"https://api.torn.com/faction/?selections=chain&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
+        url = f"https://api.torn.com/faction/?selections=chain&key={TORN_API_KEY}&comment=GimpBot"
+        headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=20) as response:
                 response.raise_for_status()

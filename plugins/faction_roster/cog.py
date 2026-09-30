@@ -149,7 +149,7 @@ class FactionRoster(commands.Cog):
         return parsed._replace(query=urlencode(params)).geturl()
 
     async def fetch_json(self, url, timeout_seconds=20):
-        headers = {"User-Agent": "StrikeBot/1.0"}
+        headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=timeout_seconds) as response:
                 response.raise_for_status()
@@ -159,8 +159,8 @@ class FactionRoster(commands.Cog):
         if not TORN_API_KEY:
             return None
         urls = [
-            f"https://api.torn.com/user/{int(torn_id)}?selections=discord&key={TORN_API_KEY}&comment=StrikeBot",
-            f"https://api.torn.com/v2/user/{int(torn_id)}/discord?key={TORN_API_KEY}&comment=StrikeBot",
+            f"https://api.torn.com/user/{int(torn_id)}?selections=discord&key={TORN_API_KEY}&comment=GimpBot",
+            f"https://api.torn.com/v2/user/{int(torn_id)}/discord?key={TORN_API_KEY}&comment=GimpBot",
         ]
         for url in urls:
             try:

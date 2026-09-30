@@ -203,8 +203,8 @@ class OverdoseMonitor(commands.Cog):
     async def fetch_news(self):
         if not TORN_API_KEY:
             return {}
-        url = f"https://api.torn.com/faction/?selections=mainnews&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
+        url = f"https://api.torn.com/faction/?selections=mainnews&key={TORN_API_KEY}&comment=GimpBot"
+        headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=20) as response:
                 response.raise_for_status()
@@ -371,11 +371,11 @@ class OverdoseMonitor(commands.Cog):
                 "selections": "personalstats",
                 "stat": "overdosed",
                 "key": TORN_API_KEY,
-                "comment": "StrikeBot",
+                "comment": "GimpBot",
             }
         )
         url = f"https://api.torn.com/user/{int(user_id)}?{qs}"
-        req = urllib.request.Request(url, headers={"User-Agent": "StrikeBot/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "GimpBot/1.0"})
         with urllib.request.urlopen(req, timeout=20) as response:
             data = json.loads(response.read().decode("utf-8"))
         if data.get("error"):

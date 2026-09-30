@@ -135,9 +135,9 @@ class OCToolsMonitor(commands.Cog):
     async def refresh_item_catalog(self):
         if not TORN_API_KEY:
             return
-        url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}&comment=StrikeBot"
+        url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}&comment=GimpBot"
         try:
-            async with aiohttp.ClientSession(headers={"User-Agent": "StrikeBot/1.0"}) as session:
+            async with aiohttp.ClientSession(headers={"User-Agent": "GimpBot/1.0"}) as session:
                 async with session.get(url, timeout=30) as response:
                     response.raise_for_status()
                     data = await response.json()
