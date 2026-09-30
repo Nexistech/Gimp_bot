@@ -16,7 +16,6 @@ try:
 except ImportError:
     AUTO_STRIKE_DELAY_HOURS = 4
 
-CHECK_HOUR_UTC = 16
 MAX_LINES = 12
 MIN_DAYS_AFTER_RECRUIT = 3
 FREELOADER_DAYS_IN_FACTION_MIN = 30
@@ -29,6 +28,18 @@ def utc_now():
 
 class DailyDigest(commands.Cog):
     SETTINGS_SCHEMA = [
+        {
+            "key": "run_hour_utc",
+            "type": "int",
+            "label": "Digest hour (0-23, stored as UTC, not shown in the post)",
+            "default": 16,
+        },
+        {
+            "key": "run_minute_utc",
+            "type": "int",
+            "label": "Digest minute (0-59, stored as UTC, not shown in the post)",
+            "default": 0,
+        },
         {
             "key": "exclude_all_ids",
             "type": "int_list",
@@ -76,10 +87,17 @@ class DailyDigest(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
+        self.digest_task.change_interval(time=self.digest_time())
         self.digest_task.start()
 
     def reload_settings(self, data=None):
         self.settings = data or load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
+        self.digest_task.change_interval(time=self.digest_time())
+
+    def digest_time(self):
+        hour = max(0, min(23, int(self.settings.get("run_hour_utc") or 16)))
+        minute = max(0, min(59, int(self.settings.get("run_minute_utc") or 0)))
+        return datetime.time(hour=hour, minute=minute, tzinfo=datetime.timezone.utc)
 
     def cog_unload(self):
         self.digest_task.cancel()
@@ -212,12 +230,8 @@ class DailyDigest(commands.Cog):
     def build_embed(self, data):
         embed = discord.Embed(
             title="Faction daily digest",
-            description=(
-                f"Roster size: **{data['members']}**\n"
-                f"Last roster refresh: `{data['roster_age']}`"
-            ),
+            description=f"Roster size: **{data['members']}**",
             color=discord.Color.blurple(),
-            timestamp=utc_now(),
         )
         embed.add_field(
             name="Member → Fluffer",
@@ -272,7 +286,7 @@ class DailyDigest(commands.Cog):
         await channel.send(content=content, embed=embed)
         return True, None
 
-    @tasks.loop(time=datetime.time(hour=CHECK_HOUR_UTC, minute=0, tzinfo=datetime.timezone.utc))
+    @tasks.loop(time=datetime.time(hour=16, minute=0, tzinfo=datetime.timezone.utc))
     async def digest_task(self):
         try:
             ok, err = await self.post_digest()
