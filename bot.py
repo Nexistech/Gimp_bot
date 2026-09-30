@@ -143,11 +143,11 @@ async def reload(interaction: discord.Interaction):
     if not await bot.is_owner(interaction.user):
         return await interaction.response.send_message("You are not the owner.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    plugins_dir = "./plugins"
     reloaded = []
-    for folder in sorted(os.listdir(plugins_dir)):
-        cog_file = os.path.join(plugins_dir, folder, "cog.py")
-        if not os.path.isfile(cog_file):
+    failed = []
+    enabled = set(enabled_plugins())
+    for folder in plugin_folders():
+        if enabled and folder not in enabled:
             continue
         extension = f"plugins.{folder}.cog"
         try:
@@ -159,20 +159,26 @@ async def reload(interaction: discord.Interaction):
                 await bot.load_extension(extension)
                 reloaded.append(f"{folder} (loaded new)")
                 log.info("Loaded new plugin on reload: %s", folder)
-            except Exception:
+            except Exception as e:
                 log.exception("Failed to load %s during reload", folder)
-                return await interaction.followup.send(f"Failed to load {folder}. See bot.log.")
+                failed.append(f"{folder}: {e}")
         except Exception as e:
             log.exception("Failed to reload %s", folder)
-            return await interaction.followup.send(f"Failed to reload {folder}: {e}")
+            failed.append(f"{folder}: {e}")
+    lines = []
+    if reloaded:
+        lines.append("Reloaded: " + ", ".join(reloaded))
+    if failed:
+        lines.append("Failed: " + "; ".join(failed))
+    if not lines:
+        lines.append("No plugins to reload.")
     try:
         await bot.sync_guild_commands()
-        await interaction.followup.send(
-            f"Reloaded plugins ({', '.join(reloaded)}) and re-synced command tree!"
-        )
+        lines.append("Command tree re-synced.")
     except Exception as e:
         log.exception("Reload command sync failed")
-        await interaction.followup.send(f"Plugins reloaded, but command sync failed: {e}")
+        lines.append(f"Command sync failed: {e}")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="reboot", description="Restart the bot process.")
