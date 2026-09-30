@@ -14,7 +14,7 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
-from plugin_settings import load_root_settings, load_settings, schema_defaults
+from plugin_settings import load_root_settings, load_settings, save_settings, schema_defaults
 
 try:
     from config import TORN_API_KEY
@@ -335,7 +335,7 @@ class OverdoseMonitor(commands.Cog):
         <form method="post" action="/plugin/__PLUGIN__/action">
           <input type="hidden" name="action" value="add_comment">
           <label>New comment</label>
-          <textarea name="text" rows="2" placeholder="Snark goes here"></textarea>
+          <textarea name="text" rows="6" placeholder="One comment per line"></textarea>
           <button type="submit">Add comment</button>
         </form>
         """
@@ -462,14 +462,14 @@ class OverdoseMonitor(commands.Cog):
             conn.close()
             return "Comment removed."
         if action == "add_comment":
-            text = str(data.get("text") or "").strip()
-            if not text:
+            lines = [line.strip() for line in str(data.get("text") or "").splitlines() if line.strip()]
+            if not lines:
                 conn.close()
                 return "Comment was empty."
-            conn.execute("INSERT INTO od_comments (text) VALUES (?)", (text,))
+            conn.executemany("INSERT INTO od_comments (text) VALUES (?)", [(line,) for line in lines])
             conn.commit()
             conn.close()
-            return "Comment added."
+            return f"Added {len(lines)} comment(s)."
         conn.close()
         return "Unknown action."
 
