@@ -1,9 +1,13 @@
 import datetime
+import json
 import os
 import random
 import re
 import sqlite3
 import sys
+import time
+import urllib.parse
+import urllib.request
 
 import aiohttp
 import discord
@@ -152,6 +156,9 @@ class OverdoseMonitor(commands.Cog):
             )
             """
         )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(od_counts)").fetchall()}
+        if "lifetime_fetched" not in cols:
+            conn.execute("ALTER TABLE od_counts ADD COLUMN lifetime_fetched INTEGER NOT NULL DEFAULT 0")
         existing = conn.execute("SELECT COUNT(*) FROM od_comments").fetchone()[0]
         if existing == 0:
             conn.executemany("INSERT INTO od_comments (text) VALUES (?)", [(c,) for c in DEFAULT_COMMENTS])
@@ -299,7 +306,9 @@ class OverdoseMonitor(commands.Cog):
 
     def web_tables(self):
         conn = self.db()
-        counts = conn.execute("SELECT user_id, name, year_count, total FROM od_counts ORDER BY total DESC, name").fetchall()
+        counts = conn.execute(
+            "SELECT user_id, name, year_count, total, lifetime_fetched FROM od_counts ORDER BY total DESC, name"
+        ).fetchall()
         comments = conn.execute("SELECT id, text FROM od_comments ORDER BY id").fetchall()
         conn.close()
         count_rows = [
@@ -308,6 +317,7 @@ class OverdoseMonitor(commands.Cog):
                 "Member": row["name"] or row["user_id"],
                 "This year": row["year_count"],
                 "All time": row["total"],
+                "API seeded": "yes" if row["lifetime_fetched"] else "no",
             }
             for row in counts
         ]
@@ -332,10 +342,17 @@ class OverdoseMonitor(commands.Cog):
         return [
             {
                 "title": "Stored overdose counts",
-                "columns": ["Member", "This year", "All time"],
+                "columns": ["Member", "This year", "All time", "API seeded"],
                 "rows": count_rows,
                 "row_actions": [{"action": "set_counts_row", "label": "Save", "include_min": False}],
-                "add_form": count_form,
+                "add_form": count_form
+                + """
+        <form method="post" action="/plugin/__PLUGIN__/action">
+          <input type="hidden" name="action" value="fetch_lifetimes">
+          <p class="help">Pulls public personalstats.overdosed for roster members who have never been seeded. Already-seeded IDs are skipped.</p>
+          <button type="submit">Fetch all-time OD stats for unseeded members</button>
+        </form>
+        """,
             },
             {
                 "title": "Snark comments",
@@ -346,9 +363,81 @@ class OverdoseMonitor(commands.Cog):
             },
         ]
 
+    def fetch_lifetime(self, user_id):
+        if not TORN_API_KEY:
+            raise RuntimeError("TORN_API_KEY missing")
+        qs = urllib.parse.urlencode(
+            {
+                "selections": "personalstats",
+                "stat": "overdosed",
+                "key": TORN_API_KEY,
+                "comment": "StrikeBot",
+            }
+        )
+        url = f"https://api.torn.com/user/{int(user_id)}?{qs}"
+        req = urllib.request.Request(url, headers={"User-Agent": "StrikeBot/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+        stats = data.get("personalstats") or {}
+        if isinstance(stats, dict) and "overdosed" in stats:
+            return int(stats.get("overdosed") or 0)
+        if isinstance(stats, list):
+            for item in stats:
+                if str(item.get("name") or "").lower() == "overdosed":
+                    return int(item.get("value") or 0)
+        return int(stats.get("overdosed") or 0)
+
     def web_action(self, data):
         action = data.get("action")
         conn = self.db()
+        if action == "fetch_lifetimes":
+            conn.close()
+            roster = self.bot.get_cog("FactionRoster")
+            if not roster:
+                return "Roster is not loaded."
+            conn = self.db()
+            fetched_ids = {
+                int(row["user_id"])
+                for row in conn.execute("SELECT user_id FROM od_counts WHERE lifetime_fetched = 1")
+            }
+            conn.close()
+            pending = []
+            for member in roster.all_members():
+                user_id = int(member.get("id") or member.get("user_id"))
+                if user_id in fetched_ids:
+                    continue
+                pending.append((user_id, member.get("name") or str(user_id)))
+            updated, failed = 0, 0
+            year = utc_now().year
+            for user_id, name in pending:
+                try:
+                    total = self.fetch_lifetime(user_id)
+                except Exception as exc:
+                    print(f"[Overdose] lifetime fetch failed for {user_id}: {exc}")
+                    failed += 1
+                    time.sleep(0.4)
+                    continue
+                conn = self.db()
+                row = conn.execute("SELECT year_count FROM od_counts WHERE user_id = ?", (user_id,)).fetchone()
+                year_count = int(row["year_count"]) if row else 0
+                conn.execute(
+                    """
+                    INSERT INTO od_counts (user_id, name, total, year, year_count, lifetime_fetched)
+                    VALUES (?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        name=excluded.name,
+                        total=excluded.total,
+                        lifetime_fetched=1
+                    """,
+                    (user_id, name, total, year, year_count),
+                )
+                conn.commit()
+                conn.close()
+                updated += 1
+                time.sleep(0.4)
+            return f"Seeded all-time OD stats for {updated} member(s). Skipped {len(fetched_ids)} already seeded. Failed {failed}."
         if action == "set_counts":
             user_id = int(data.get("user_id"))
             total = int(data.get("total") or 0)
