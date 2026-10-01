@@ -475,15 +475,6 @@ class StrikeCommands(commands.Cog):
     async def before_oc_monitor(self):
         await self._wait_for_roster()
 
-    @app_commands.command(name="check", description="Checks bot status.")
-    async def check_command(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            f"Bot running. Cached members: {len(self.active_members_cache)}. "
-            f"Last member refresh: {self.last_member_refresh}. "
-            f"Last crime refresh: {self.last_crime_refresh}.",
-            ephemeral=True,
-        )
-
     @app_commands.command(name="strike", description="Issue a strike.")
     async def strike_command(self, interaction: discord.Interaction, username: str):
         await interaction.response.defer(ephemeral=True)
