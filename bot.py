@@ -26,7 +26,7 @@ def setup_logging():
 
     logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("discord.http").setLevel(logging.WARNING)
-    return logging.getLogger("GimpBot")
+    return logging.getLogger("StrikeBot")
 
 
 log = setup_logging()
@@ -47,7 +47,7 @@ def remove_pid_file():
 atexit.register(remove_pid_file)
 
 
-class GimpBot(commands.Bot):
+class StrikeBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
 
@@ -135,7 +135,7 @@ class GimpBot(commands.Bot):
             log.exception("Command sync failed")
 
 
-bot = GimpBot()
+bot = StrikeBot()
 
 
 @bot.tree.command(name="reload", description="Reload all plugins without restarting.")
@@ -179,6 +179,20 @@ async def reload(interaction: discord.Interaction):
         log.exception("Reload command sync failed")
         lines.append(f"Command sync failed: {e}")
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="check", description="Show bot and plugin health.")
+async def check(interaction: discord.Interaction):
+    watchdog = bot.get_cog("Watchdog")
+    if watchdog and hasattr(watchdog, "send_status"):
+        return await watchdog.send_status(interaction)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    cogs = ", ".join(sorted(bot.cogs.keys())) or "(none)"
+    await interaction.followup.send(
+        f"Watchdog is not loaded.\nLogged in as `{bot.user}`\nCogs: {cogs}\nPID `{os.getpid()}`",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="reboot", description="Restart the bot process.")
