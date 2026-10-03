@@ -403,6 +403,9 @@ class StrikeCommands(commands.Cog):
                 continue
             if now_ts <= ready_at_int + delay_seconds:
                 continue
+            status = str(crime.get("status") or "").strip().lower()
+            if status != "planning":
+                continue
             for slot in crime.get("slots", []) or []:
                 user = slot.get("user") or {}
                 user_id = user.get("id")
