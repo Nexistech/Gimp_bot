@@ -672,7 +672,10 @@ class ArmoryPayout(commands.Cog):
             )
             button.callback = mark
             view.add_item(button)
-        await interaction.followup.send(text, view=view, ephemeral=True)
+        if view is None:
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.followup.send(text, view=view, ephemeral=True)
 
     @payout_command.autocomplete("member")
     async def payout_member(self, interaction: discord.Interaction, current: str):
