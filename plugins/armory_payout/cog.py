@@ -7,10 +7,11 @@ The first deposit of an item in 24 hours loads the public item market,
 averages the cheapest 10 listing prices, and caches that average. Later
 deposits of the same item reuse it until the cache is a day old.
 
-/payout shows the caller's own unpaid total unless they have a role from
-this plugin's settings. Those roles can look up any member and mark the
-open deposits paid. Twenty minutes later, funds news must contain a payment
-to that member within 10% of the total. Otherwise the deposits go back to unpaid.
+/payout shows the caller's own unpaid total unless they have a payout role.
+Those roles can look up any member, mark the balance paid, or press Done to
+check faction payday logs immediately. Only a "was paid ... from the faction"
+line counts, not a vault "was given" withdrawal. A separate clear role can
+zero a balance with /payout member:name clear:True.
 """
 
 import datetime
@@ -45,6 +46,10 @@ SKIP_RE = re.compile(r"\b(used|loaned|gave|given|returned)\b", re.I)
 MONEY_RE = re.compile(r"\$([\d,]+)")
 TAG_RE = re.compile(r"<[^>]+>")
 XID_RE = re.compile(r"XID=(\d+)", re.I)
+PAYDAY_RE = re.compile(
+    r"^(?P<name>.+?) was paid \$(?P<amount>[\d,]+) for a total of \$[\d,]+ from the faction by .+$",
+    re.I,
+)
 
 
 def utc_now():
@@ -80,6 +85,13 @@ class ArmoryPayout(commands.Cog):
             "key": "payout_roles",
             "type": "str_list",
             "label": "Roles that can look up any member and mark a payout paid",
+            "default": [],
+            "widget": "discord_roles",
+        },
+        {
+            "key": "clear_roles",
+            "type": "str_list",
+            "label": "Roles that can zero a member's unpaid balance",
             "default": [],
             "widget": "discord_roles",
         },
@@ -220,12 +232,18 @@ class ArmoryPayout(commands.Cog):
             return roster.get_member(int(text))
         return roster.get_member_by_name(text)
 
-    def payout_role_names(self):
-        return {str(name) for name in (self.settings.get("payout_roles") or [])}
+    def role_names(self, key):
+        return {str(name) for name in (self.settings.get(key) or [])}
+
+    def has_role(self, member, key):
+        names = self.role_names(key)
+        return any(role.name in names for role in getattr(member, "roles", []))
 
     def is_payout_staff(self, member):
-        names = self.payout_role_names()
-        return any(role.name in names for role in getattr(member, "roles", []))
+        return self.has_role(member, "payout_roles")
+
+    def is_clear_staff(self, member):
+        return self.has_role(member, "clear_roles")
 
     def cached_price(self, item_id):
         conn = self.db()
@@ -493,21 +511,140 @@ class ArmoryPayout(commands.Cog):
         return rows
 
     def payment_matches(self, text, torn_name, amount):
-        low = str(text or "")
-        if "deposited" in low.lower() and not re.search(r"\bgave\b|\bpaid\b|\bsent\b", low, re.I):
+        match = PAYDAY_RE.match(" ".join(str(text or "").split()))
+        if not match:
             return False
-        found = []
-        for raw in MONEY_RE.findall(low):
-            try:
-                found.append(int(raw.replace(",", "")))
-            except ValueError:
+        if match.group("name").strip().casefold() != str(torn_name or "").strip().casefold():
+            return False
+        paid = int(match.group("amount").replace(",", ""))
+        return abs(paid - int(amount)) <= max(1, int(int(amount) * AMOUNT_TOLERANCE))
+
+    def used_payday_ids(self):
+        conn = self.db()
+        rows = conn.execute(
+            "SELECT news_text FROM payouts WHERE status = 'paid' AND news_text IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        return {str(row["news_text"]).split("\n", 1)[0] for row in rows}
+
+    async def fetch_give_funds(self):
+        url = (
+            "https://api.torn.com/v2/faction/news?cat=giveFunds&striptags=true&limit=100"
+            f"&key={TORN_API_KEY}&comment=GimpBot"
+        )
+        payload = await self.torn_get(url)
+        news = payload.get("news") or []
+        return news if isinstance(news, list) else []
+
+    async def find_payday(self, torn_name, amount, not_before=0):
+        used = self.used_payday_ids()
+        for item in await self.fetch_give_funds():
+            if not isinstance(item, dict):
                 continue
-        if not any(abs(value - int(amount)) <= max(1, int(int(amount) * AMOUNT_TOLERANCE)) for value in found):
-            return False
-        recipient = re.search(r"\bto\s+(.+)$", low, re.I)
-        if not recipient:
-            return False
-        return torn_name.lower() in recipient.group(1).lower()
+            news_id = str(item.get("id") or "")
+            if news_id and news_id in used:
+                continue
+            timestamp = int(item.get("timestamp") or 0)
+            if not_before and timestamp and timestamp < int(not_before):
+                continue
+            text = str(item.get("text") or item.get("news") or "")
+            if self.payment_matches(text, torn_name, amount):
+                return {"id": news_id, "text": text, "timestamp": timestamp}
+        return None
+
+    def mark_rows_paid(self, torn_id, torn_name, amount, payday, existing_payout_id=None):
+        note = f"{payday.get('id') or ''}\n{payday.get('text') or ''}"[:500]
+        conn = self.db()
+        if existing_payout_id:
+            conn.execute(
+                "UPDATE payouts SET status = 'paid', news_text = ? WHERE id = ?",
+                (note, int(existing_payout_id)),
+            )
+            conn.execute(
+                "UPDATE deposits SET status = 'paid' WHERE payout_id = ? AND status = 'pending'",
+                (int(existing_payout_id),),
+            )
+        else:
+            now_ts = int(utc_now().timestamp())
+            cursor = conn.execute(
+                """
+                INSERT INTO payouts (torn_id, torn_name, amount, marked_by, marked_at, verify_after, status, news_text)
+                VALUES (?, ?, ?, NULL, ?, ?, 'paid', ?)
+                """,
+                (int(torn_id), torn_name, int(amount), now_ts, now_ts, note),
+            )
+            conn.execute(
+                """
+                UPDATE deposits
+                SET status = 'paid', payout_id = ?
+                WHERE torn_id = ? AND status = 'unpaid'
+                """,
+                (cursor.lastrowid, int(torn_id)),
+            )
+        conn.commit()
+        conn.close()
+
+    def clear_balance(self, torn_id):
+        conn = self.db()
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(total), 0) AS owed, COUNT(*) AS deposits
+            FROM deposits
+            WHERE torn_id = ? AND status IN ('unpaid', 'pending')
+            """,
+            (int(torn_id),),
+        ).fetchone()
+        conn.execute(
+            """
+            UPDATE deposits SET status = 'cleared', payout_id = NULL
+            WHERE torn_id = ? AND status IN ('unpaid', 'pending')
+            """,
+            (int(torn_id),),
+        )
+        conn.execute(
+            "UPDATE payouts SET status = 'cleared' WHERE torn_id = ? AND status = 'pending'",
+            (int(torn_id),),
+        )
+        conn.commit()
+        conn.close()
+        return int(row["owed"] or 0), int(row["deposits"] or 0)
+
+    async def confirm_done(self, interaction, torn_id):
+        if not self.is_payout_staff(interaction.user):
+            if not interaction.response.is_done():
+                await interaction.response.send_message("You cannot confirm payouts.", ephemeral=True)
+            return
+        async with self._pay_lock:
+            if interaction.response.is_done():
+                return
+            member = self.member_for_query(str(torn_id))
+            name = (member or {}).get("name") or str(torn_id)
+            pending = self.rows_for(torn_id=torn_id, status="pending")
+            unpaid = self.rows_for(torn_id=torn_id, status="unpaid")
+            rows = pending or unpaid
+            amount = sum(int(row["total"] or 0) for row in rows)
+            if amount <= 0:
+                await interaction.response.send_message("Nothing owed to check.", ephemeral=True)
+                return
+            not_before = min(int(row["deposited_at"] or 0) for row in rows)
+            try:
+                payday = await self.find_payday(name, amount, not_before)
+            except Exception as exc:
+                await interaction.response.send_message(f"Could not read faction pay logs: {exc}", ephemeral=True)
+                return
+            if not payday:
+                await interaction.response.send_message(
+                    f"No payday log for **{name}** near {format_money(amount)}. "
+                    "A vault line that says \"was given\" does not count.",
+                    ephemeral=True,
+                )
+                return
+            payout_id = pending[0]["payout_id"] if pending else None
+            self.mark_rows_paid(torn_id, name, amount, payday, payout_id)
+            await interaction.response.send_message(
+                f"Payday confirmed for **{name}**: {payday['text']}",
+                ephemeral=True,
+            )
 
     async def verify_due_payouts(self):
         now_ts = int(utc_now().timestamp())
@@ -519,47 +656,36 @@ class ArmoryPayout(commands.Cog):
         conn.close()
         if not due or not TORN_API_KEY:
             return
-        url = f"https://api.torn.com/faction/?selections=fundsnews&striptags=true&key={TORN_API_KEY}&comment=GimpBot"
         try:
-            payload = await self.torn_get(url)
+            await self.fetch_give_funds()
         except Exception as exc:
-            print(f"[ArmoryPayout] fundsnews failed, leaving payouts pending: {exc}")
+            print(f"[ArmoryPayout] giveFunds failed, leaving payouts pending: {exc}")
             return
-        news = payload.get("fundsnews") or payload.get("news") or {}
-        texts = []
-        items = news.values() if isinstance(news, dict) else news
-        for item in items or []:
-            if isinstance(item, dict):
-                texts.append(str(item.get("news") or item.get("text") or ""))
-            else:
-                texts.append(str(item))
         for payout in due:
-            matched = next(
-                (
-                    text
-                    for text in texts
-                    if self.payment_matches(text, payout["torn_name"], payout["amount"])
-                ),
-                None,
-            )
+            try:
+                matched = await self.find_payday(payout["torn_name"], payout["amount"], payout["marked_at"])
+            except Exception as exc:
+                print(f"[ArmoryPayout] Payday check failed for {payout['torn_name']}: {exc}")
+                continue
             conn = self.db()
             if matched:
+                note = f"{matched.get('id') or ''}\n{matched.get('text') or ''}"[:500]
                 conn.execute(
                     "UPDATE deposits SET status = 'paid' WHERE payout_id = ? AND status = 'pending'",
                     (payout["id"],),
                 )
                 conn.execute(
                     "UPDATE payouts SET status = 'paid', news_text = ? WHERE id = ?",
-                    (matched[:500], payout["id"]),
+                    (note, payout["id"]),
                 )
-                print(f"[ArmoryPayout] Confirmed payout #{payout['id']} for {payout['torn_name']}.")
+                print(f"[ArmoryPayout] Confirmed payday for {payout['torn_name']}.")
             else:
                 conn.execute(
                     "UPDATE deposits SET status = 'unpaid', payout_id = NULL WHERE payout_id = ? AND status = 'pending'",
                     (payout["id"],),
                 )
                 conn.execute("UPDATE payouts SET status = 'reverted' WHERE id = ?", (payout["id"],))
-                print(f"[ArmoryPayout] No matching funds news for {payout['torn_name']}. Payout returned to unpaid.")
+                print(f"[ArmoryPayout] No payday log for {payout['torn_name']}. Payout returned to unpaid.")
             conn.commit()
             conn.close()
 
@@ -725,10 +851,33 @@ class ArmoryPayout(commands.Cog):
         await self.bot.wait_until_ready()
 
     @app_commands.command(name="payout", description="Show armory deposit money owed.")
-    @app_commands.describe(member="Torn name or ID. Ignored unless you have a payout role.")
-    async def payout_command(self, interaction: discord.Interaction, member: str = None):
+    @app_commands.describe(
+        member="Torn name or ID. Ignored unless you have a payout role.",
+        clear="Zero this member's unpaid balance. Clear role only.",
+    )
+    async def payout_command(self, interaction: discord.Interaction, member: str = None, clear: bool = False):
         await interaction.response.defer(ephemeral=True)
         staff = self.is_payout_staff(interaction.user)
+        if clear and not self.is_clear_staff(interaction.user):
+            if staff:
+                return await interaction.followup.send(
+                    "You can mark a payout, but you cannot clear a balance.",
+                    ephemeral=True,
+                )
+            clear = False
+        if clear:
+            if not member:
+                return await interaction.followup.send("Choose a member to clear.", ephemeral=True)
+            target = self.member_for_query(member)
+            if not target:
+                return await interaction.followup.send(f"No roster member matched `{member}`.", ephemeral=True)
+            torn_id = int(target.get("id") or target.get("user_id"))
+            owed, count = self.clear_balance(torn_id)
+            return await interaction.followup.send(
+                f"Cleared {count} deposit(s) for **{target.get('name')}** [{torn_id}], "
+                f"removing {format_money(owed)}.",
+                ephemeral=True,
+            )
         if staff and member:
             target = self.member_for_query(member)
             if not target:
@@ -772,19 +921,30 @@ class ArmoryPayout(commands.Cog):
         pending = self.rows_for(torn_id=torn_id, status="pending")
         text, owed = self.describe_member(target, unpaid, pending)
         view = None
-        if staff and owed > 0 and not pending:
+        if staff and (owed > 0 or pending):
             view = ui.View(timeout=None)
 
             async def mark(button_interaction, torn_id=torn_id):
                 await self.mark_paid(button_interaction, torn_id)
 
-            button = ui.Button(
-                label="Mark paid",
-                style=discord.ButtonStyle.green,
-                custom_id=f"armorypay:paid:{torn_id}",
+            async def done(button_interaction, torn_id=torn_id):
+                await self.confirm_done(button_interaction, torn_id)
+
+            if owed > 0 and not pending:
+                mark_button = ui.Button(
+                    label="Mark paid",
+                    style=discord.ButtonStyle.green,
+                    custom_id=f"armorypay:paid:{torn_id}",
+                )
+                mark_button.callback = mark
+                view.add_item(mark_button)
+            done_button = ui.Button(
+                label="Done",
+                style=discord.ButtonStyle.blurple,
+                custom_id=f"armorypay:done:{torn_id}",
             )
-            button.callback = mark
-            view.add_item(button)
+            done_button.callback = done
+            view.add_item(done_button)
         if view is None:
             await interaction.followup.send(text, ephemeral=True)
         else:
@@ -811,15 +971,16 @@ class ArmoryPayout(commands.Cog):
         if interaction.type is not discord.InteractionType.component:
             return
         custom_id = str((interaction.data or {}).get("custom_id") or "")
-        if not custom_id.startswith("armorypay:paid:"):
-            return
         if interaction.response.is_done():
             return
         try:
             torn_id = int(custom_id.rsplit(":", 1)[-1])
         except ValueError:
             return
-        await self.mark_paid(interaction, torn_id)
+        if custom_id.startswith("armorypay:paid:"):
+            await self.mark_paid(interaction, torn_id)
+        elif custom_id.startswith("armorypay:done:"):
+            await self.confirm_done(interaction, torn_id)
 
     def web_tables(self):
         rows = []
