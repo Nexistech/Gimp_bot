@@ -259,7 +259,11 @@ class ArmoryPayout(commands.Cog):
     def listing_costs(self, payload):
         raw = None
         if isinstance(payload, dict):
-            raw = payload.get("itemmarket") or payload.get("listings") or payload.get("itemmarketlistings")
+            itemmarket = payload.get("itemmarket") or payload.get("itemMarket") or {}
+            if isinstance(itemmarket, dict):
+                raw = itemmarket.get("listings")
+            if raw is None:
+                raw = payload.get("listings") or payload.get("itemmarketlistings") or itemmarket
         if raw is None:
             raw = payload
         if isinstance(raw, dict):
@@ -268,12 +272,9 @@ class ArmoryPayout(commands.Cog):
         for row in raw or []:
             if not isinstance(row, dict):
                 continue
-            cost = row.get("cost")
+            cost = row.get("price")
             if cost is None:
-                cost = row.get("price")
-            item = row.get("item")
-            if cost is None and isinstance(item, dict):
-                cost = item.get("price") or item.get("cost") or item.get("market_price")
+                cost = row.get("cost")
             if cost is None:
                 continue
             try:
@@ -283,9 +284,9 @@ class ArmoryPayout(commands.Cog):
         return costs
 
     async def market_average(self, item_id):
-        url = f"https://api.torn.com/market/{int(item_id)}?selections=itemmarket&key={TORN_API_KEY}&comment=GimpBot"
+        url = f"https://api.torn.com/v2/market/{int(item_id)}/itemmarket?key={TORN_API_KEY}&comment=GimpBot&offset=0"
         payload = await self.torn_get(url)
-        costs = sorted(self.listing_costs(payload))[:10]
+        costs = sorted(cost for cost in self.listing_costs(payload) if cost > 0)[:10]
         if not costs:
             return None
         return int(round(sum(costs) / len(costs)))
@@ -632,12 +633,57 @@ class ArmoryPayout(commands.Cog):
                     )
             await interaction.response.send_message(message, ephemeral=True)
 
+    async def reprice_unpriced(self):
+        conn = self.db()
+        rows = conn.execute(
+            """
+            SELECT id, item_id, item_name, quantity
+            FROM deposits
+            WHERE status = 'unpaid' AND IFNULL(total, 0) = 0
+            """
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            item_id = row["item_id"]
+            item_name = row["item_name"] or ""
+            if not item_id:
+                item_id, item_name = self.match_item_id(item_name)
+                if not item_id:
+                    await self.refresh_item_catalog()
+                    item_id, item_name = self.match_item_id(row["item_name"] or "")
+            if not item_id:
+                continue
+            try:
+                priced = await self.price_for(item_id, item_name)
+            except Exception as exc:
+                print(f"[ArmoryPayout] Reprice failed for {item_name}: {exc}")
+                continue
+            if not priced:
+                continue
+            total = int(row["quantity"] or 0) * int(priced)
+            conn = self.db()
+            conn.execute(
+                """
+                UPDATE deposits
+                SET item_id = ?, item_name = ?, unit_price = ?, total = ?
+                WHERE id = ? AND status = 'unpaid'
+                """,
+                (int(item_id), item_name, int(priced), total, row["id"]),
+            )
+            conn.commit()
+            conn.close()
+            print(f"[ArmoryPayout] Repriced {item_name} to {format_money(priced)} each.")
+
     @tasks.loop(minutes=1)
     async def watch_task(self):
         try:
             await self.poll_armory_news()
         except Exception as exc:
             print(f"[ArmoryPayout] News poll failed: {exc}")
+        try:
+            await self.reprice_unpriced()
+        except Exception as exc:
+            print(f"[ArmoryPayout] Reprice pass failed: {exc}")
         try:
             await self.verify_due_payouts()
         except Exception as exc:
