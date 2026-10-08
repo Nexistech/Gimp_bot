@@ -38,6 +38,7 @@ DB_NAME = os.path.join(PLUGIN_DIR, "armory_payout.db")
 OC_TOOLS_DB = os.path.join(os.getcwd(), "plugins", "oc_tools", "oc_tools.db")
 PRICE_TTL_SECONDS = 24 * 3600
 VERIFY_AFTER_SECONDS = 20 * 60
+NEWS_LOOKBACK_SECONDS = 5 * 60
 AMOUNT_TOLERANCE = 0.10
 DEPOSIT_RE = re.compile(r"deposited\s+([\d,]+)\s*x\s+(.+?)(?:\s+into\b.*)?$", re.I)
 SKIP_RE = re.compile(r"\b(used|loaned|gave|given|returned)\b", re.I)
@@ -315,14 +316,10 @@ class ArmoryPayout(commands.Cog):
         if not TORN_API_KEY:
             return
         now_ts = int(utc_now().timestamp())
-        cursor = self.meta_get("armory_cursor")
-        if cursor is None:
-            self.meta_set("armory_cursor", now_ts)
-            print("[ArmoryPayout] Ignoring armory news from before this start.")
-            return
+        from_ts = now_ts - NEWS_LOOKBACK_SECONDS
         url = (
             "https://api.torn.com/faction/?selections=armorynews&striptags=true"
-            f"&from={int(cursor)}&to={now_ts}&key={TORN_API_KEY}&comment=GimpBot"
+            f"&from={from_ts}&to={now_ts}&key={TORN_API_KEY}&comment=GimpBot"
         )
         try:
             payload = await self.torn_get(url)
@@ -340,10 +337,10 @@ class ArmoryPayout(commands.Cog):
                 if isinstance(row, dict):
                     entries.append((str(row.get("id") or index), row))
         entries.sort(key=lambda pair: int((pair[1].get("timestamp") or 0)))
-        newest = int(cursor)
         for news_id, row in entries:
             timestamp = int(row.get("timestamp") or 0)
-            newest = max(newest, timestamp)
+            if timestamp and timestamp < from_ts:
+                continue
             text = str(row.get("news") or row.get("text") or "")
             parsed = self.parse_deposit(text)
             if not parsed:
@@ -376,8 +373,6 @@ class ArmoryPayout(commands.Cog):
                 f"[ArmoryPayout] {torn_name} deposited {quantity}x {clean_name} "
                 f"at {format_money(unit_price)} each."
             )
-        if newest > int(cursor):
-            self.meta_set("armory_cursor", newest)
 
     def news_seen(self, news_id):
         conn = self.db()
