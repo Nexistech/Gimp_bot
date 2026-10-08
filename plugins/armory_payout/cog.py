@@ -635,18 +635,32 @@ class ArmoryPayout(commands.Cog):
             if not target:
                 return await interaction.followup.send(f"No roster member matched `{member}`.", ephemeral=True)
         elif staff and not member:
-            rows = self.unpaid_summary()
-            if not rows:
-                return await interaction.followup.send("Nobody has unpaid armory deposits.", ephemeral=True)
-            lines = [
-                f"• **{row['torn_name']}** [{row['torn_id'] or '?'}] — {format_money(row['owed'])}"
-                for row in rows[:40]
-            ]
-            return await interaction.followup.send(
-                "Unpaid armory deposits. Use `/payout member:` to see the items and mark one paid.\n"
-                + "\n".join(lines),
-                ephemeral=True,
-            )
+            rows = [row for row in self.unpaid_summary() if int(row["owed"] or 0) > 0]
+            self_member = self.member_for_discord(interaction.user)
+            self_id = None
+            if self_member:
+                self_id = int(self_member.get("id") or self_member.get("user_id") or 0)
+            mine = next((row for row in rows if self_id and int(row["torn_id"] or 0) == self_id), None)
+            others = [row for row in rows if not (self_id and int(row["torn_id"] or 0) == self_id)]
+            lines = []
+            if mine:
+                lines.append(
+                    f"**You:** **{mine['torn_name']}** [{mine['torn_id']}] — {format_money(mine['owed'])}"
+                )
+            elif not self_member:
+                lines.append("Your Torn account is not linked on the roster, so your own total is not shown.")
+            if others:
+                if lines:
+                    lines.append("")
+                lines.append("**Others owed**")
+                lines.extend(
+                    f"• **{row['torn_name']}** [{row['torn_id'] or '?'}] — {format_money(row['owed'])}"
+                    for row in others[:40]
+                )
+            if not mine and not others:
+                return await interaction.followup.send("Nobody is owed a payout.", ephemeral=True)
+            lines.append("\nUse `/payout member:` to see the items and mark one paid.")
+            return await interaction.followup.send("\n".join(lines), ephemeral=True)
         else:
             target = self.member_for_discord(interaction.user)
             if not target:
