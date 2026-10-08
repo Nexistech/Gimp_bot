@@ -43,6 +43,8 @@ AMOUNT_TOLERANCE = 0.10
 DEPOSIT_RE = re.compile(r"deposited\s+([\d,]+)\s*x\s+(.+?)(?:\s+into\b.*)?$", re.I)
 SKIP_RE = re.compile(r"\b(used|loaned|gave|given|returned)\b", re.I)
 MONEY_RE = re.compile(r"\$([\d,]+)")
+TAG_RE = re.compile(r"<[^>]+>")
+XID_RE = re.compile(r"XID=(\d+)", re.I)
 
 
 def utc_now():
@@ -299,18 +301,47 @@ class ArmoryPayout(commands.Cog):
         return average
 
     def parse_deposit(self, text):
-        if not text or SKIP_RE.search(text) or "deposited" not in text.lower():
+        plain = TAG_RE.sub("", text or "")
+        plain = " ".join(plain.replace("&", "&").split())
+        linked_id = None
+        xid = XID_RE.search(text or "")
+        if xid:
+            linked_id = int(xid.group(1))
+        if not plain or SKIP_RE.search(plain) or "deposited" not in plain.lower():
             return None
-        match = DEPOSIT_RE.search(text.strip())
+        match = DEPOSIT_RE.search(plain)
         if not match:
             return None
         quantity = int(match.group(1).replace(",", ""))
         item_name = match.group(2).strip(" .")
-        donor = text[: match.start()].strip(" .")
+        donor = plain[: match.start()].strip(" .")
         donor = re.sub(r"\s+has$", "", donor, flags=re.I).strip()
-        if not donor or quantity < 1 or not item_name:
+        if quantity < 1 or not item_name or not (donor or linked_id):
             return None
-        return donor, quantity, item_name
+        return donor, quantity, item_name, linked_id
+
+    async def refresh_item_catalog(self):
+        if not TORN_API_KEY or getattr(self, "_catalog_fetched", False):
+            return
+        self._catalog_fetched = True
+        url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}&comment=GimpBot"
+        try:
+            payload = await self.torn_get(url)
+        except Exception as exc:
+            print(f"[ArmoryPayout] Item catalog fetch failed: {exc}")
+            return
+        mapping = {}
+        for raw_id, info in (payload.get("items") or {}).items():
+            name = (info or {}).get("name") if isinstance(info, dict) else None
+            if not name:
+                continue
+            try:
+                mapping[int(raw_id)] = name
+            except (TypeError, ValueError):
+                continue
+        if mapping:
+            self.item_names.update(mapping)
+            print(f"[ArmoryPayout] Cached {len(mapping)} item names.")
 
     async def poll_armory_news(self):
         if not TORN_API_KEY:
@@ -345,16 +376,22 @@ class ArmoryPayout(commands.Cog):
             parsed = self.parse_deposit(text)
             if not parsed:
                 continue
-            if self.news_seen(news_id):
+            donor, quantity, item_name, linked_id = parsed
+            if self.deposit_complete(news_id):
                 continue
-            donor, quantity, item_name = parsed
-            member = self.member_for_query(donor)
-            torn_id = None
-            torn_name = donor
+            roster = self.get_roster()
+            member = roster.get_member(linked_id) if roster and linked_id else None
+            if not member:
+                member = self.member_for_query(donor)
+            torn_id = linked_id
+            torn_name = donor or str(linked_id or "Unknown")
             if member:
-                torn_id = int(member.get("id") or member.get("user_id"))
-                torn_name = member.get("name") or donor
+                torn_id = int(member.get("id") or member.get("user_id") or linked_id)
+                torn_name = member.get("name") or torn_name
             item_id, clean_name = self.match_item_id(item_name)
+            if not item_id:
+                await self.refresh_item_catalog()
+                item_id, clean_name = self.match_item_id(item_name)
             unit_price = 0
             if item_id:
                 try:
@@ -366,41 +403,62 @@ class ArmoryPayout(commands.Cog):
                     print(f"[ArmoryPayout] No market price for {clean_name} [{item_id}]. Deposit saved at $0.")
                 else:
                     unit_price = int(priced)
-            self.insert_deposit(
+            self.save_deposit(
                 news_id, torn_id, torn_name, clean_name, item_id, quantity, unit_price, timestamp
             )
             print(
-                f"[ArmoryPayout] {torn_name} deposited {quantity}x {clean_name} "
+                f"[ArmoryPayout] {torn_name} [{torn_id}] deposited {quantity}x {clean_name} "
                 f"at {format_money(unit_price)} each."
             )
 
-    def news_seen(self, news_id):
+    def deposit_complete(self, news_id):
         conn = self.db()
-        row = conn.execute("SELECT 1 FROM deposits WHERE news_id = ?", (str(news_id),)).fetchone()
+        row = conn.execute(
+            "SELECT torn_id, total, status FROM deposits WHERE news_id = ?",
+            (str(news_id),),
+        ).fetchone()
         conn.close()
-        return bool(row)
+        if not row:
+            return False
+        if row["status"] in {"paid", "pending"}:
+            return True
+        return bool(row["torn_id"]) and int(row["total"] or 0) > 0
 
-    def insert_deposit(self, news_id, torn_id, torn_name, item_name, item_id, quantity, unit_price, timestamp):
+    def save_deposit(self, news_id, torn_id, torn_name, item_name, item_id, quantity, unit_price, timestamp):
         conn = self.db()
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO deposits (
-                news_id, torn_id, torn_name, item_name, item_id, quantity,
-                unit_price, total, deposited_at, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unpaid')
-            """,
-            (
-                str(news_id),
-                torn_id,
-                torn_name,
-                item_name,
-                item_id,
-                int(quantity),
-                int(unit_price),
-                int(quantity) * int(unit_price),
-                int(timestamp),
-            ),
-        )
+        existing = conn.execute("SELECT id, status FROM deposits WHERE news_id = ?", (str(news_id),)).fetchone()
+        total = int(quantity) * int(unit_price)
+        if existing:
+            if existing["status"] == "unpaid":
+                conn.execute(
+                    """
+                    UPDATE deposits
+                    SET torn_id = ?, torn_name = ?, item_name = ?, item_id = ?, quantity = ?,
+                        unit_price = ?, total = ?
+                    WHERE news_id = ? AND status = 'unpaid'
+                    """,
+                    (torn_id, torn_name, item_name, item_id, int(quantity), int(unit_price), total, str(news_id)),
+                )
+        else:
+            conn.execute(
+                """
+                INSERT INTO deposits (
+                    news_id, torn_id, torn_name, item_name, item_id, quantity,
+                    unit_price, total, deposited_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unpaid')
+                """,
+                (
+                    str(news_id),
+                    torn_id,
+                    torn_name,
+                    item_name,
+                    item_id,
+                    int(quantity),
+                    int(unit_price),
+                    total,
+                    int(timestamp),
+                ),
+            )
         conn.commit()
         conn.close()
 
