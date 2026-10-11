@@ -94,6 +94,19 @@ class WithdrawView(ui.View):
         await self.cog.cancel_request(interaction, self.request_id)
 
 
+class ExpiredView(ui.View):
+    def __init__(self, request_id):
+        super().__init__(timeout=None)
+        self.add_item(
+            ui.Button(
+                label="EXPIRED",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+                custom_id=f"banking:expired:{request_id}",
+            )
+        )
+
+
 class WithdrawAllView(ui.View):
     def __init__(self, cog, timeout_text):
         super().__init__(timeout=120)
@@ -256,9 +269,11 @@ class Banking(commands.Cog):
         return embed
 
     def view_for(self, row):
-        if row["status"] != "open":
-            return None
-        return WithdrawView(self, row)
+        if row["status"] == "open":
+            return WithdrawView(self, row)
+        if row["status"] == "expired":
+            return ExpiredView(row["id"])
+        return None
 
     async def update_message(self, row, extra=None, interaction=None):
         embed = self.request_embed(row, extra)
