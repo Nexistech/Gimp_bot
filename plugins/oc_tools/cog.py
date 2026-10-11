@@ -8,6 +8,9 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("oc_tools")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 try:
@@ -135,17 +138,17 @@ class OCToolsMonitor(commands.Cog):
     async def refresh_item_catalog(self):
         if not TORN_API_KEY:
             return
-        url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}&comment=GimpBot"
+        url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}&comment=StrikeBot"
         try:
-            async with aiohttp.ClientSession(headers={"User-Agent": "GimpBot/1.0"}) as session:
+            async with aiohttp.ClientSession(headers={"User-Agent": "StrikeBot/1.0"}) as session:
                 async with session.get(url, timeout=30) as response:
                     response.raise_for_status()
                     data = await response.json()
         except Exception as exc:
-            print(f"[OC Tools] Item catalog fetch failed: {exc}")
+            log.error(f"[OC Tools] Item catalog fetch failed: {exc}")
             return
         if data.get("error"):
-            print(f"[OC Tools] Item catalog API error: {data['error']}")
+            log.error(f"[OC Tools] Item catalog API error: {data['error']}")
             return
         items = data.get("items") or {}
         mapping = {}
@@ -159,7 +162,7 @@ class OCToolsMonitor(commands.Cog):
                 mapping[item_id] = name
         if mapping:
             self.store_item_names(mapping)
-            print(f"[OC Tools] Cached {len(mapping)} item names.")
+            log.info(f"[OC Tools] Cached {len(mapping)} item names.")
 
     async def ensure_item_names(self, needed_ids):
         if any(int(item_id) not in self.item_names for item_id in needed_ids):
@@ -230,7 +233,7 @@ class OCToolsMonitor(commands.Cog):
         root = load_root_settings()
         channel = self.bot.get_channel(int(root.get("SPAM_CHANNEL_ID") or 0))
         if not channel:
-            print("[OC Tools] Spam channel not found.")
+            log.warning("[OC Tools] Spam channel not found.")
             return False
         roster = self.get_roster()
         member = roster.get_member(entry["user_id"]) if roster else None
@@ -271,7 +274,7 @@ class OCToolsMonitor(commands.Cog):
             await channel.send(content=" ".join(mentions) if mentions else None, embed=embed)
             return True
         except discord.Forbidden:
-            print("[OC Tools] Forbidden sending missing-item alert.")
+            log.error("[OC Tools] Forbidden sending missing-item alert.")
             return False
 
     @tasks.loop(minutes=10)

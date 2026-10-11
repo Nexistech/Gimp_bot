@@ -14,6 +14,9 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("overdose")
 from plugin_settings import load_root_settings, load_settings, save_settings, schema_defaults
 
 try:
@@ -203,14 +206,14 @@ class OverdoseMonitor(commands.Cog):
     async def fetch_news(self):
         if not TORN_API_KEY:
             return {}
-        url = f"https://api.torn.com/faction/?selections=mainnews&key={TORN_API_KEY}&comment=GimpBot"
-        headers = {"User-Agent": "GimpBot/1.0"}
+        url = f"https://api.torn.com/faction/?selections=mainnews&key={TORN_API_KEY}&comment=StrikeBot"
+        headers = {"User-Agent": "StrikeBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=20) as response:
                 response.raise_for_status()
                 data = await response.json()
         if data.get("error"):
-            print(f"[Overdose] API error: {data['error']}")
+            log.error(f"[Overdose] API error: {data['error']}")
             return {}
         return data.get("mainnews") or data.get("news") or {}
 
@@ -271,7 +274,7 @@ class OverdoseMonitor(commands.Cog):
         try:
             news = await self.fetch_news()
         except Exception as exc:
-            print(f"[Overdose] Fetch failed: {exc}")
+            log.error(f"[Overdose] Fetch failed: {exc}")
             return
         items = list(news.items()) if isinstance(news, dict) else list(enumerate(news))
         conn = self.db()
@@ -297,7 +300,7 @@ class OverdoseMonitor(commands.Cog):
             try:
                 await self.post_od(parsed, year_count, total)
             except discord.HTTPException as exc:
-                print(f"[Overdose] Send failed: {exc}")
+                log.error(f"[Overdose] Send failed: {exc}")
         conn.close()
 
     @check_task.before_loop
@@ -371,11 +374,11 @@ class OverdoseMonitor(commands.Cog):
                 "selections": "personalstats",
                 "stat": "overdosed",
                 "key": TORN_API_KEY,
-                "comment": "GimpBot",
+                "comment": "StrikeBot",
             }
         )
         url = f"https://api.torn.com/user/{int(user_id)}?{qs}"
-        req = urllib.request.Request(url, headers={"User-Agent": "GimpBot/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "StrikeBot/1.0"})
         with urllib.request.urlopen(req, timeout=20) as response:
             data = json.loads(response.read().decode("utf-8"))
         if data.get("error"):
@@ -415,7 +418,7 @@ class OverdoseMonitor(commands.Cog):
                 try:
                     total = self.fetch_lifetime(user_id)
                 except Exception as exc:
-                    print(f"[Overdose] lifetime fetch failed for {user_id}: {exc}")
+                    log.error(f"[Overdose] lifetime fetch failed for {user_id}: {exc}")
                     failed += 1
                     time.sleep(0.4)
                     continue

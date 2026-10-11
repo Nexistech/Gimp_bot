@@ -4,29 +4,22 @@ import os
 import sys
 import aiohttp
 import discord
-import logging
-from logging.handlers import RotatingFileHandler
 from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+logger = get_logger("shoplifting")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 PLUGIN_DIR = os.path.dirname(__file__)
 DB_NAME = os.path.join(PLUGIN_DIR, "shoplifting_monitor.db")
-LOG_FILE = os.path.join(PLUGIN_DIR, "shoplifting.log")
 
 try:
     from config import TORN_API_KEY
 except ImportError:
     TORN_API_KEY = ""
-
-logger = logging.getLogger("ShopliftingMonitor")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=100000, backupCount=3)
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logger.addHandler(handler)
 
 STORES = {
     "sallys_sweet_shop": "Sally's Sweet Shop",
@@ -42,9 +35,7 @@ SINGLE_DEVICE_STORES = {"sallys_sweet_shop", "Bits_n_bobs"}
 
 
 class ShopliftingMonitor(commands.Cog):
-    SETTINGS_SCHEMA = [
-        {"key": "enable_logging", "type": "bool", "label": "Write shoplifting.log", "default": True},
-    ]
+    SETTINGS_SCHEMA = []
 
     def __init__(self, bot):
         self.bot = bot

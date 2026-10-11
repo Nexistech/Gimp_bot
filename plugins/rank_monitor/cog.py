@@ -7,6 +7,9 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("rank_monitor")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "rank_monitor.db")
@@ -90,7 +93,7 @@ class RankMonitor(commands.Cog):
         root = load_root_settings()
         channel = self.bot.get_channel(int(root.get("SPAM_CHANNEL_ID") or 0))
         if channel is None:
-            print("[RankMonitor] SPAM_CHANNEL_ID not found.")
+            log.warning("[RankMonitor] SPAM_CHANNEL_ID not found.")
             return False
         mentions = []
         if channel.guild:
@@ -104,7 +107,7 @@ class RankMonitor(commands.Cog):
             await channel.send(text)
             return True
         except discord.Forbidden:
-            print("[RankMonitor] Forbidden sending to spam channel.")
+            log.error("[RankMonitor] Forbidden sending to spam channel.")
             return False
 
     def suggested_rank_for(self, member):
@@ -132,7 +135,7 @@ class RankMonitor(commands.Cog):
     async def rank_check_task(self):
         roster = self.get_roster()
         if not roster:
-            print("[RankMonitor] FactionRoster cog not loaded yet.")
+            log.warning("[RankMonitor] FactionRoster cog not loaded yet.")
             return
         members = roster.all_members()
         if not members:

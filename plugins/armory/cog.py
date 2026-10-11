@@ -8,6 +8,9 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("armory")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 try:
@@ -113,9 +116,9 @@ class ArmoryTracker(commands.Cog):
             raise RuntimeError("TORN_API_KEY missing")
         url = (
             f"https://api.torn.com/faction/?selections={SELECTIONS}"
-            f"&key={TORN_API_KEY}&comment=GimpBot"
+            f"&key={TORN_API_KEY}&comment=StrikeBot"
         )
-        headers = {"User-Agent": "GimpBot/1.0"}
+        headers = {"User-Agent": "StrikeBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=30) as response:
                 response.raise_for_status()
@@ -192,7 +195,7 @@ class ArmoryTracker(commands.Cog):
         channel_id = int(self.settings.get("channel_id") or 0) or int(root.get("SPAM_CHANNEL_ID") or 0)
         channel = self.bot.get_channel(channel_id)
         if not channel:
-            print("[Armory] Alert channel not found.")
+            log.warning("[Armory] Alert channel not found.")
             return False
         by_cat = {}
         for row in low:
@@ -226,7 +229,7 @@ class ArmoryTracker(commands.Cog):
         low = self.low_stock()
         if low:
             await self.post_low_stock(low)
-        print(f"[Armory] Snapshot {len(items)} in-stock items, {len(low)} below minimum.")
+        log.info(f"[Armory] Snapshot {len(items)} in-stock items, {len(low)} below minimum.")
 
     @tasks.loop(hours=1)
     async def check_task(self):
@@ -236,7 +239,7 @@ class ArmoryTracker(commands.Cog):
                 return
             await self.run_check()
         except Exception as exc:
-            print(f"[Armory] Daily check failed: {exc}")
+            log.error(f"[Armory] Daily check failed: {exc}")
 
     @check_task.before_loop
     async def before_check(self):
@@ -381,7 +384,7 @@ class ArmoryTracker(commands.Cog):
         try:
             await self.run_check()
         except Exception as exc:
-            print(f"[Armory] Manual refresh failed: {exc}")
+            log.error(f"[Armory] Manual refresh failed: {exc}")
 
 
 async def setup(bot: commands.Bot):

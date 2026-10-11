@@ -27,6 +27,9 @@ from discord import app_commands, ui
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("armory_payout")
 from plugin_settings import load_settings, schema_defaults
 
 try:
@@ -47,7 +50,7 @@ MONEY_RE = re.compile(r"\$([\d,]+)")
 TAG_RE = re.compile(r"<[^>]+>")
 XID_RE = re.compile(r"XID=(\d+)", re.I)
 PAYDAY_RE = re.compile(
-    r"^(?P<name>.+?) was paid \$(?P<amount>[\d,]+) for a total of \$[\d,]+ from the faction by .+$",
+    r"^(?P<name>.+?) was paid \$(?P<amount>[\d,]+) for a total of \$[\d,]+ from the faction by (?P<payor>.+)$",
     re.I,
 )
 
@@ -102,14 +105,17 @@ class ArmoryPayout(commands.Cog):
         self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.item_names = {}
         self._pay_lock = asyncio.Lock()
+        self._scan_lock = asyncio.Lock()
         self.initialize_db()
         self.load_item_names()
         self.digest_task.change_interval(time=self.digest_time())
         self.watch_task.start()
+        self.payday_task.start()
         self.digest_task.start()
 
     def cog_unload(self):
         self.watch_task.cancel()
+        self.payday_task.cancel()
         self.digest_task.cancel()
 
     def reload_settings(self, data=None):
@@ -165,10 +171,29 @@ class ArmoryPayout(commands.Cog):
                 status TEXT,
                 news_text TEXT
             );
+            CREATE TABLE IF NOT EXISTS pay_notes (
+                id INTEGER PRIMARY KEY,
+                news_id TEXT UNIQUE,
+                torn_id INTEGER,
+                torn_name TEXT,
+                amount INTEGER,
+                paid_at INTEGER,
+                payor TEXT,
+                deposit_id INTEGER
+            );
             """
         )
+        self.ensure_column(conn, "prices", "low", "INTEGER")
+        self.ensure_column(conn, "prices", "high", "INTEGER")
+        self.ensure_column(conn, "deposits", "unit_low", "INTEGER")
+        self.ensure_column(conn, "deposits", "unit_high", "INTEGER")
         conn.commit()
         conn.close()
+
+    def ensure_column(self, conn, table, name, declaration):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if name not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def meta_get(self, key):
         conn = self.db()
@@ -247,19 +272,25 @@ class ArmoryPayout(commands.Cog):
 
     def cached_price(self, item_id):
         conn = self.db()
-        row = conn.execute("SELECT average, sampled_at FROM prices WHERE item_id = ?", (int(item_id),)).fetchone()
+        row = conn.execute(
+            "SELECT average, low, high, sampled_at FROM prices WHERE item_id = ?",
+            (int(item_id),),
+        ).fetchone()
         conn.close()
-        if not row:
+        if not row or row["low"] is None or row["high"] is None:
             return None
         if int(utc_now().timestamp()) - int(row["sampled_at"]) > PRICE_TTL_SECONDS:
             return None
-        return int(row["average"])
+        return int(row["low"]), int(row["high"]), int(row["average"])
 
-    def store_price(self, item_id, item_name, average):
+    def store_price(self, item_id, item_name, low, high, average):
         conn = self.db()
         conn.execute(
-            "INSERT OR REPLACE INTO prices (item_id, item_name, average, sampled_at) VALUES (?, ?, ?, ?)",
-            (int(item_id), item_name, int(average), int(utc_now().timestamp())),
+            """
+            INSERT OR REPLACE INTO prices (item_id, item_name, low, high, average, sampled_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (int(item_id), item_name, int(low), int(high), int(average), int(utc_now().timestamp())),
         )
         conn.commit()
         conn.close()
@@ -307,17 +338,21 @@ class ArmoryPayout(commands.Cog):
         costs = sorted(cost for cost in self.listing_costs(payload) if cost > 0)[:10]
         if not costs:
             return None
-        return int(round(sum(costs) / len(costs)))
+        low = int(costs[0])
+        high = int(costs[-1])
+        average = int(round(sum(costs) / len(costs)))
+        return low, high, average
 
     async def price_for(self, item_id, item_name):
         cached = self.cached_price(item_id)
         if cached is not None:
             return cached
-        average = await self.market_average(item_id)
-        if average is None:
+        priced = await self.market_average(item_id)
+        if priced is None:
             return None
-        self.store_price(item_id, item_name, average)
-        return average
+        low, high, average = priced
+        self.store_price(item_id, item_name, low, high, average)
+        return low, high, average
 
     def parse_deposit(self, text):
         plain = TAG_RE.sub("", text or "")
@@ -347,7 +382,7 @@ class ArmoryPayout(commands.Cog):
         try:
             payload = await self.torn_get(url)
         except Exception as exc:
-            print(f"[ArmoryPayout] Item catalog fetch failed: {exc}")
+            log.error(f"[ArmoryPayout] Item catalog fetch failed: {exc}")
             return
         mapping = {}
         for raw_id, info in (payload.get("items") or {}).items():
@@ -360,7 +395,7 @@ class ArmoryPayout(commands.Cog):
                 continue
         if mapping:
             self.item_names.update(mapping)
-            print(f"[ArmoryPayout] Cached {len(mapping)} item names.")
+            log.info(f"[ArmoryPayout] Cached {len(mapping)} item names.")
 
     async def poll_armory_news(self):
         if not TORN_API_KEY:
@@ -374,7 +409,7 @@ class ArmoryPayout(commands.Cog):
         try:
             payload = await self.torn_get(url)
         except Exception as exc:
-            print(f"[ArmoryPayout] armorynews failed: {exc}")
+            log.error(f"[ArmoryPayout] armorynews failed: {exc}")
             return
         news = payload.get("armorynews") or payload.get("news") or {}
         entries = []
@@ -411,21 +446,22 @@ class ArmoryPayout(commands.Cog):
             if not item_id:
                 await self.refresh_item_catalog()
                 item_id, clean_name = self.match_item_id(item_name)
-            unit_price = 0
+            unit_low = unit_high = unit_price = 0
             if item_id:
                 try:
                     priced = await self.price_for(item_id, clean_name)
                 except Exception as exc:
-                    print(f"[ArmoryPayout] Price lookup failed for {clean_name}: {exc}")
+                    log.error(f"[ArmoryPayout] Price lookup failed for {clean_name}: {exc}")
                     priced = None
                 if priced is None:
-                    print(f"[ArmoryPayout] No market price for {clean_name} [{item_id}]. Deposit saved at $0.")
+                    log.info(f"[ArmoryPayout] No market price for {clean_name} [{item_id}]. Deposit saved at $0.")
                 else:
-                    unit_price = int(priced)
+                    unit_low, unit_high, unit_price = priced
             self.save_deposit(
-                news_id, torn_id, torn_name, clean_name, item_id, quantity, unit_price, timestamp
+                news_id, torn_id, torn_name, clean_name, item_id, quantity,
+                unit_low, unit_high, unit_price, timestamp,
             )
-            print(
+            log.info(
                 f"[ArmoryPayout] {torn_name} [{torn_id}] deposited {quantity}x {clean_name} "
                 f"at {format_money(unit_price)} each."
             )
@@ -443,7 +479,7 @@ class ArmoryPayout(commands.Cog):
             return True
         return bool(row["torn_id"]) and int(row["total"] or 0) > 0
 
-    def save_deposit(self, news_id, torn_id, torn_name, item_name, item_id, quantity, unit_price, timestamp):
+    def save_deposit(self, news_id, torn_id, torn_name, item_name, item_id, quantity, unit_low, unit_high, unit_price, timestamp):
         conn = self.db()
         existing = conn.execute("SELECT id, status FROM deposits WHERE news_id = ?", (str(news_id),)).fetchone()
         total = int(quantity) * int(unit_price)
@@ -453,18 +489,21 @@ class ArmoryPayout(commands.Cog):
                     """
                     UPDATE deposits
                     SET torn_id = ?, torn_name = ?, item_name = ?, item_id = ?, quantity = ?,
-                        unit_price = ?, total = ?
+                        unit_low = ?, unit_high = ?, unit_price = ?, total = ?
                     WHERE news_id = ? AND status = 'unpaid'
                     """,
-                    (torn_id, torn_name, item_name, item_id, int(quantity), int(unit_price), total, str(news_id)),
+                    (
+                        torn_id, torn_name, item_name, item_id, int(quantity),
+                        int(unit_low), int(unit_high), int(unit_price), total, str(news_id),
+                    ),
                 )
         else:
             conn.execute(
                 """
                 INSERT INTO deposits (
                     news_id, torn_id, torn_name, item_name, item_id, quantity,
-                    unit_price, total, deposited_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'unpaid')
+                    unit_low, unit_high, unit_price, total, deposited_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unpaid')
                 """,
                 (
                     str(news_id),
@@ -473,6 +512,8 @@ class ArmoryPayout(commands.Cog):
                     item_name,
                     item_id,
                     int(quantity),
+                    int(unit_low),
+                    int(unit_high),
                     int(unit_price),
                     total,
                     int(timestamp),
@@ -522,10 +563,176 @@ class ArmoryPayout(commands.Cog):
     def used_payday_ids(self):
         conn = self.db()
         rows = conn.execute(
-            "SELECT news_text FROM payouts WHERE status = 'paid' AND news_text IS NOT NULL"
+            "SELECT news_text FROM payouts WHERE news_text IS NOT NULL"
+        ).fetchall()
+        notes = conn.execute("SELECT news_id FROM pay_notes").fetchall()
+        conn.close()
+        used = {str(row["news_text"]).split("\n", 1)[0] for row in rows}
+        used.update(str(row["news_id"]) for row in notes if row["news_id"])
+        return used
+
+    def deposit_bounds(self, row):
+        quantity = max(1, int(row["quantity"] or 1))
+        price = int(row["unit_price"] or 0)
+        low = price if row["unit_low"] is None else int(row["unit_low"])
+        high = price if row["unit_high"] is None else int(row["unit_high"])
+        if high < low:
+            low, high = high, low
+        return low * quantity, high * quantity
+
+    def parse_payday(self, text):
+        match = PAYDAY_RE.match(" ".join(str(text or "").split()))
+        if not match:
+            return None
+        return {
+            "name": match.group("name").strip(),
+            "amount": int(match.group("amount").replace(",", "")),
+            "payor": match.group("payor").strip(),
+        }
+
+    def settle_deposit(self, deposit, payday):
+        note = f"{payday.get('id') or ''}\n{payday.get('text') or ''}"[:500]
+        now_ts = int(utc_now().timestamp())
+        conn = self.db()
+        cursor = conn.execute(
+            """
+            INSERT INTO payouts (torn_id, torn_name, amount, marked_by, marked_at, verify_after, status, news_text)
+            VALUES (?, ?, ?, NULL, ?, ?, 'paid', ?)
+            """,
+            (
+                deposit.get("torn_id"),
+                deposit.get("torn_name"),
+                int(payday["amount"]),
+                now_ts,
+                now_ts,
+                note,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE deposits
+            SET status = 'paid', payout_id = ?
+            WHERE id = ? AND status IN ('unpaid', 'pending')
+            """,
+            (cursor.lastrowid, deposit["id"]),
+        )
+        conn.commit()
+        conn.close()
+
+    def save_pay_note(self, payday, torn_id, torn_name):
+        conn = self.db()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO pay_notes (news_id, torn_id, torn_name, amount, paid_at, payor, deposit_id)
+            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                payday.get("id"),
+                torn_id,
+                torn_name,
+                int(payday["amount"]),
+                int(payday.get("timestamp") or 0),
+                payday.get("payor"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+    async def fill_missing_ranges(self):
+        conn = self.db()
+        rows = conn.execute(
+            """
+            SELECT id, item_id, item_name
+            FROM deposits
+            WHERE status IN ('unpaid', 'pending') AND unit_low IS NULL AND item_id IS NOT NULL
+            """
         ).fetchall()
         conn.close()
-        return {str(row["news_text"]).split("\n", 1)[0] for row in rows}
+        for row in rows:
+            try:
+                priced = await self.price_for(row["item_id"], row["item_name"] or "")
+            except Exception as exc:
+                log.error(f"[ArmoryPayout] Range lookup failed for {row['item_name']}: {exc}")
+                continue
+            if not priced:
+                continue
+            low, high, _average = priced
+            conn = self.db()
+            conn.execute(
+                "UPDATE deposits SET unit_low = ?, unit_high = ? WHERE id = ? AND unit_low IS NULL",
+                (int(low), int(high), row["id"]),
+            )
+            conn.commit()
+            conn.close()
+
+    async def scan_paydays(self):
+        if not TORN_API_KEY:
+            return []
+        async with self._scan_lock:
+            await self.fill_missing_ranges()
+            news = await self.fetch_give_funds()
+            used = self.used_payday_ids()
+            conn = self.db()
+            open_rows = conn.execute(
+                "SELECT * FROM deposits WHERE status IN ('unpaid', 'pending') ORDER BY deposited_at"
+            ).fetchall()
+            donors = conn.execute("SELECT torn_id, torn_name FROM deposits").fetchall()
+            conn.close()
+            open_deposits = [dict(row) for row in open_rows]
+            donor_ids = {}
+            for row in donors:
+                if not row["torn_name"]:
+                    continue
+                donor_ids.setdefault(str(row["torn_name"]).casefold(), row["torn_id"])
+            actions = []
+            items = sorted(
+                (item for item in news if isinstance(item, dict)),
+                key=lambda item: int(item.get("timestamp") or 0),
+            )
+            for item in items:
+                news_id = str(item.get("id") or "")
+                if not news_id or news_id in used:
+                    continue
+                parsed = self.parse_payday(item.get("text") or item.get("news") or "")
+                if not parsed:
+                    continue
+                payday = {
+                    "id": news_id,
+                    "text": str(item.get("text") or item.get("news") or ""),
+                    "timestamp": int(item.get("timestamp") or 0),
+                    **parsed,
+                }
+                name_key = parsed["name"].casefold()
+                matches = []
+                for deposit in open_deposits:
+                    if str(deposit.get("torn_name") or "").casefold() != name_key:
+                        continue
+                    low, high = self.deposit_bounds(deposit)
+                    if high > 0 and low <= parsed["amount"] <= high:
+                        matches.append(deposit)
+                if matches:
+                    best = min(
+                        matches,
+                        key=lambda deposit: (
+                            abs(int(deposit["total"] or 0) - parsed["amount"]),
+                            int(deposit["deposited_at"] or 0),
+                        ),
+                    )
+                    self.settle_deposit(best, payday)
+                    open_deposits.remove(best)
+                    used.add(news_id)
+                    actions.append(("paid", best.get("torn_id"), payday))
+                    log.info(
+                        f"[ArmoryPayout] Payday {format_money(parsed['amount'])} matched "
+                        f"{best.get('item_name')} for {parsed['name']}."
+                    )
+                    continue
+                if name_key not in donor_ids:
+                    continue
+                self.save_pay_note(payday, donor_ids[name_key], parsed["name"])
+                used.add(news_id)
+                actions.append(("note", donor_ids[name_key], payday))
+            return actions
 
     async def fetch_give_funds(self):
         url = (
@@ -619,32 +826,28 @@ class ArmoryPayout(commands.Cog):
                 return
             member = self.member_for_query(str(torn_id))
             name = (member or {}).get("name") or str(torn_id)
-            pending = self.rows_for(torn_id=torn_id, status="pending")
-            unpaid = self.rows_for(torn_id=torn_id, status="unpaid")
-            rows = pending or unpaid
-            amount = sum(int(row["total"] or 0) for row in rows)
-            if amount <= 0:
-                await interaction.response.send_message("Nothing owed to check.", ephemeral=True)
-                return
-            not_before = min(int(row["deposited_at"] or 0) for row in rows)
             try:
-                payday = await self.find_payday(name, amount, not_before)
+                actions = await self.scan_paydays()
             except Exception as exc:
                 await interaction.response.send_message(f"Could not read faction pay logs: {exc}", ephemeral=True)
                 return
-            if not payday:
+            mine = [action for action in actions if action[1] and int(action[1]) == int(torn_id)]
+            if not mine:
                 await interaction.response.send_message(
-                    f"No payday log for **{name}** near {format_money(amount)}. "
-                    "A vault line that says \"was given\" does not count.",
+                    f"No new payday for **{name}** fell inside an open deposit's price range.",
                     ephemeral=True,
                 )
                 return
-            payout_id = pending[0]["payout_id"] if pending else None
-            self.mark_rows_paid(torn_id, name, amount, payday, payout_id)
-            await interaction.response.send_message(
-                f"Payday confirmed for **{name}**: {payday['text']}",
-                ephemeral=True,
-            )
+            lines = []
+            for kind, _, payday in mine:
+                if kind == "paid":
+                    lines.append(f"Matched {format_money(payday['amount'])} to an open deposit.")
+                else:
+                    when = datetime.datetime.fromtimestamp(int(payday["timestamp"]), datetime.timezone.utc).strftime("%Y-%m-%d")
+                    lines.append(
+                        f"    Paid {format_money(payday['amount'])} on {when} by {payday['payor']}"
+                    )
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     async def verify_due_payouts(self):
         now_ts = int(utc_now().timestamp())
@@ -657,35 +860,28 @@ class ArmoryPayout(commands.Cog):
         if not due or not TORN_API_KEY:
             return
         try:
-            await self.fetch_give_funds()
+            await self.scan_paydays()
         except Exception as exc:
-            print(f"[ArmoryPayout] giveFunds failed, leaving payouts pending: {exc}")
+            log.error(f"[ArmoryPayout] giveFunds failed, leaving payouts pending: {exc}")
             return
         for payout in due:
-            try:
-                matched = await self.find_payday(payout["torn_name"], payout["amount"], payout["marked_at"])
-            except Exception as exc:
-                print(f"[ArmoryPayout] Payday check failed for {payout['torn_name']}: {exc}")
-                continue
             conn = self.db()
-            if matched:
-                note = f"{matched.get('id') or ''}\n{matched.get('text') or ''}"[:500]
-                conn.execute(
-                    "UPDATE deposits SET status = 'paid' WHERE payout_id = ? AND status = 'pending'",
-                    (payout["id"],),
-                )
-                conn.execute(
-                    "UPDATE payouts SET status = 'paid', news_text = ? WHERE id = ?",
-                    (note, payout["id"]),
-                )
-                print(f"[ArmoryPayout] Confirmed payday for {payout['torn_name']}.")
-            else:
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS n FROM deposits WHERE payout_id = ? AND status = 'pending'",
+                (payout["id"],),
+            ).fetchone()
+            if remaining and int(remaining["n"] or 0):
                 conn.execute(
                     "UPDATE deposits SET status = 'unpaid', payout_id = NULL WHERE payout_id = ? AND status = 'pending'",
                     (payout["id"],),
                 )
                 conn.execute("UPDATE payouts SET status = 'reverted' WHERE id = ?", (payout["id"],))
-                print(f"[ArmoryPayout] No payday log for {payout['torn_name']}. Payout returned to unpaid.")
+                log.info(f"[ArmoryPayout] No in-range payday for {payout['torn_name']}. Payout returned to unpaid.")
+            else:
+                conn.execute(
+                    "UPDATE payouts SET status = 'paid' WHERE id = ? AND status = 'pending'",
+                    (payout["id"],),
+                )
             conn.commit()
             conn.close()
 
@@ -696,14 +892,18 @@ class ArmoryPayout(commands.Cog):
         lines = []
         for row in rows[-15:]:
             when = datetime.datetime.fromtimestamp(int(row["deposited_at"]), datetime.timezone.utc).strftime("%Y-%m-%d")
+            low, high = self.deposit_bounds(row)
             lines.append(
                 f"• {when} — {row['quantity']}x {row['item_name']} at {format_money(row['unit_price'])} "
-                f"= {format_money(row['total'])}"
+                f"(range {format_money(low)}-{format_money(high)}) = {format_money(row['total'])}"
             )
         if len(rows) > 15:
             lines.insert(0, f"Showing the latest 15 of {len(rows)} unpaid deposits.")
         pending_total = sum(int(row["total"] or 0) for row in pending_rows)
         header = f"**{name}** [{torn_id}] is owed **{format_money(owed)}**."
+        notes = self.note_lines(torn_id)
+        if notes:
+            header += "\n" + "\n".join(notes)
         if pending_total:
             header += f"\n**{format_money(pending_total)}** is waiting on a vault payment check."
         if not lines:
@@ -711,6 +911,41 @@ class ArmoryPayout(commands.Cog):
         else:
             body = "\n".join(lines)
         return header + "\n" + body, owed
+
+    def note_lines(self, torn_id):
+        if not torn_id:
+            return []
+        conn = self.db()
+        rows = conn.execute(
+            """
+            SELECT amount, paid_at, payor
+            FROM pay_notes
+            WHERE torn_id = ? AND deposit_id IS NULL
+            ORDER BY paid_at DESC
+            LIMIT 8
+            """,
+            (int(torn_id),),
+        ).fetchall()
+        conn.close()
+        lines = []
+        for row in rows:
+            when = datetime.datetime.fromtimestamp(int(row["paid_at"] or 0), datetime.timezone.utc).strftime("%Y-%m-%d")
+            lines.append(f"    Paid {format_money(row['amount'])} on {when} by {row['payor'] or 'unknown'}")
+        return lines
+
+    def noted_members(self):
+        conn = self.db()
+        rows = conn.execute(
+            """
+            SELECT torn_id, torn_name
+            FROM pay_notes
+            WHERE deposit_id IS NULL AND torn_id IS NOT NULL
+            GROUP BY torn_id, torn_name
+            ORDER BY torn_name
+            """
+        ).fetchall()
+        conn.close()
+        return rows
 
     async def mark_paid(self, interaction, torn_id):
         if not self.is_payout_staff(interaction.user):
@@ -782,41 +1017,56 @@ class ArmoryPayout(commands.Cog):
             try:
                 priced = await self.price_for(item_id, item_name)
             except Exception as exc:
-                print(f"[ArmoryPayout] Reprice failed for {item_name}: {exc}")
+                log.error(f"[ArmoryPayout] Reprice failed for {item_name}: {exc}")
                 continue
             if not priced:
                 continue
-            total = int(row["quantity"] or 0) * int(priced)
+            unit_low, unit_high, unit_price = priced
+            total = int(row["quantity"] or 0) * int(unit_price)
             conn = self.db()
             conn.execute(
                 """
                 UPDATE deposits
-                SET item_id = ?, item_name = ?, unit_price = ?, total = ?
+                SET item_id = ?, item_name = ?, unit_low = ?, unit_high = ?, unit_price = ?, total = ?
                 WHERE id = ? AND status = 'unpaid'
                 """,
-                (int(item_id), item_name, int(priced), total, row["id"]),
+                (int(item_id), item_name, int(unit_low), int(unit_high), int(unit_price), total, row["id"]),
             )
             conn.commit()
             conn.close()
-            print(f"[ArmoryPayout] Repriced {item_name} to {format_money(priced)} each.")
+            log.info(
+                f"[ArmoryPayout] Repriced {item_name} to {format_money(unit_price)} "
+                f"({format_money(unit_low)}-{format_money(unit_high)})."
+            )
 
     @tasks.loop(minutes=1)
     async def watch_task(self):
         try:
             await self.poll_armory_news()
         except Exception as exc:
-            print(f"[ArmoryPayout] News poll failed: {exc}")
+            log.error(f"[ArmoryPayout] News poll failed: {exc}")
         try:
             await self.reprice_unpriced()
         except Exception as exc:
-            print(f"[ArmoryPayout] Reprice pass failed: {exc}")
+            log.error(f"[ArmoryPayout] Reprice pass failed: {exc}")
         try:
             await self.verify_due_payouts()
         except Exception as exc:
-            print(f"[ArmoryPayout] Payout check failed: {exc}")
+            log.error(f"[ArmoryPayout] Payout check failed: {exc}")
 
     @watch_task.before_loop
     async def before_watch(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=30)
+    async def payday_task(self):
+        try:
+            await self.scan_paydays()
+        except Exception as exc:
+            log.error(f"[ArmoryPayout] Payday scan failed: {exc}")
+
+    @payday_task.before_loop
+    async def before_payday(self):
         await self.bot.wait_until_ready()
 
     @tasks.loop(time=datetime.time(hour=16, tzinfo=datetime.timezone.utc))
@@ -826,7 +1076,7 @@ class ArmoryPayout(commands.Cog):
             return
         channel = self.bot.get_channel(channel_id)
         if not channel:
-            print(f"[ArmoryPayout] Digest channel {channel_id} was not found.")
+            log.warning(f"[ArmoryPayout] Digest channel {channel_id} was not found.")
             return
         rows = self.unpaid_summary()
         if not rows:
@@ -844,7 +1094,7 @@ class ArmoryPayout(commands.Cog):
         try:
             await channel.send(embed=embed)
         except discord.HTTPException as exc:
-            print(f"[ArmoryPayout] Digest send failed: {exc}")
+            log.error(f"[ArmoryPayout] Digest send failed: {exc}")
 
     @digest_task.before_loop
     async def before_digest(self):
@@ -892,20 +1142,29 @@ class ArmoryPayout(commands.Cog):
             others = [row for row in rows if not (self_id and int(row["torn_id"] or 0) == self_id)]
             lines = []
             if mine:
-                lines.append(
-                    f"**You:** **{mine['torn_name']}** [{mine['torn_id']}] — {format_money(mine['owed'])}"
-                )
+                lines.append(f"**You:** **{mine['torn_name']}** [{mine['torn_id']}] is owed **{format_money(mine['owed'])}**.")
+                lines.extend(self.note_lines(mine["torn_id"]))
             elif not self_member:
                 lines.append("Your Torn account is not linked on the roster, so your own total is not shown.")
             if others:
                 if lines:
                     lines.append("")
                 lines.append("**Others owed**")
-                lines.extend(
-                    f"• **{row['torn_name']}** [{row['torn_id'] or '?'}] — {format_money(row['owed'])}"
-                    for row in others[:40]
-                )
-            if not mine and not others:
+                for row in others[:40]:
+                    lines.append(
+                        f"**{row['torn_name']}** [{row['torn_id'] or '?'}] is owed **{format_money(row['owed'])}**."
+                    )
+                    lines.extend(self.note_lines(row["torn_id"]))
+            shown = {int(row["torn_id"]) for row in rows if row["torn_id"]}
+            for note in self.noted_members():
+                torn_id = int(note["torn_id"])
+                if torn_id in shown:
+                    continue
+                if lines:
+                    lines.append("")
+                lines.append(f"**{note['torn_name']}** [{torn_id}] is owed **$0**.")
+                lines.extend(self.note_lines(torn_id))
+            if not mine and not others and not lines:
                 return await interaction.followup.send("Nobody is owed a payout.", ephemeral=True)
             lines.append("\nUse `/payout member:` to see the items and mark one paid.")
             return await interaction.followup.send("\n".join(lines), ephemeral=True)

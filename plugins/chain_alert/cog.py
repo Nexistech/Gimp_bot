@@ -8,6 +8,9 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("chain_alert")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 try:
@@ -130,14 +133,14 @@ class ChainAlert(commands.Cog):
     async def fetch_chain(self):
         if not TORN_API_KEY:
             return None
-        url = f"https://api.torn.com/faction/?selections=chain&key={TORN_API_KEY}&comment=GimpBot"
-        headers = {"User-Agent": "GimpBot/1.0"}
+        url = f"https://api.torn.com/faction/?selections=chain&key={TORN_API_KEY}&comment=StrikeBot"
+        headers = {"User-Agent": "StrikeBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=20) as response:
                 response.raise_for_status()
                 data = await response.json()
         if data.get("error"):
-            print(f"[Chain] API error: {data['error']}")
+            log.error(f"[Chain] API error: {data['error']}")
             return None
         return data.get("chain") or data
 
@@ -149,7 +152,7 @@ class ChainAlert(commands.Cog):
         try:
             chain = await self.fetch_chain()
         except Exception as exc:
-            print(f"[Chain] Fetch failed: {exc}")
+            log.error(f"[Chain] Fetch failed: {exc}")
             return
         if not chain:
             return
@@ -212,7 +215,7 @@ class ChainAlert(commands.Cog):
         try:
             await channel.send(content=" ".join(mentions) if mentions else None, embed=embed)
         except discord.HTTPException as exc:
-            print(f"[Chain] Send failed: {exc}")
+            log.error(f"[Chain] Send failed: {exc}")
 
     @check_task.before_loop
     async def before_check(self):

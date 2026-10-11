@@ -1,22 +1,16 @@
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands, ui
+from discord import app_commands
 import sqlite3
 import datetime
 import difflib
 import os
 import sys
-from urllib.parse import parse_qs, urlencode, urlparse
-
-import aiohttp
 
 sys.path.append(os.getcwd())
-try:
-    from config import TORN_API_KEY
-except ImportError:
-    TORN_API_KEY = ""
-FACTION_MEMBERS_URL = "https://api.torn.com/v2/faction/members"
-FACTION_CRIMES_URL = "https://api.torn.com/v2/faction/crimes"
+
+from plugin_log import get_logger
+log = get_logger("strike_management")
 from plugin_settings import load_root_settings
 from plugins.strike_management.plugin import (
     AUTO_STRIKE_DELAY_HOURS,
@@ -28,58 +22,11 @@ DB_NAME = os.path.join(os.path.dirname(__file__), "strike_management.db")
 ABROAD_STATES = {"traveling", "abroad"}
 
 
-class FactionMemberView(ui.View):
-    def __init__(self, original_interaction, cog, target_username, matched_username):
-        super().__init__(timeout=60.0)
-        self.original_interaction = original_interaction
-        self.cog = cog
-        self.target_username = target_username
-        self.matched_username = matched_username
-
-    @ui.button(label="Yes, this is correct", style=discord.ButtonStyle.green)
-    async def confirm_match(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user != self.original_interaction.user:
-            return await interaction.response.send_message(
-                "Only the command issuer can confirm this.", ephemeral=True
-            )
-        await interaction.response.defer(ephemeral=True)
-        self.stop()
-        for item in self.children:
-            item.disabled = True
-        await self.original_interaction.edit_original_response(
-            content=f"✅ Confirmed. Proceeding to issue strike for `{self.matched_username}`.",
-            view=self,
-        )
-        await self.cog._issue_strike_logic(
-            username=self.matched_username,
-            interaction=interaction,
-            reason="Manual strike issued by command.",
-        )
-
-    @ui.button(label="No, search again", style=discord.ButtonStyle.red)
-    async def deny_match(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user != self.original_interaction.user:
-            return await interaction.response.send_message(
-                "Only the command issuer can deny this.", ephemeral=True
-            )
-        self.stop()
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(
-            content=f"❌ Denial received. Search for `{self.target_username}` cancelled.",
-            view=self,
-        )
-
-
 class StrikeCommands(commands.Cog):
     SETTINGS_SCHEMA = []
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.active_members_cache = set()
-        self.member_status_cache = {}
-        self.last_member_refresh = None
-        self.last_crime_refresh = None
         self.initialize_db()
         self.cleanup_old_records()
         self.normalize_existing_usernames()
@@ -99,17 +46,6 @@ class StrikeCommands(commands.Cog):
 
     def utc_now_iso(self) -> str:
         return self.utc_now().isoformat()
-
-    def build_torn_url(self, base_url: str, extra_params=None) -> str:
-        if not base_url or not TORN_API_KEY:
-            raise ValueError("URL or API Key not configured.")
-        parsed = urlparse(base_url)
-        existing = parse_qs(parsed.query, keep_blank_values=True)
-        params = {k: v[-1] for k, v in existing.items() if v}
-        if extra_params:
-            params.update({k: str(v) for k, v in extra_params.items() if v is not None})
-        params["key"] = TORN_API_KEY
-        return parsed._replace(query=urlencode(params)).geturl()
 
     def initialize_db(self):
         conn = sqlite3.connect(DB_NAME)
@@ -231,75 +167,76 @@ class StrikeCommands(commands.Cog):
     def get_roster(self):
         return self.bot.get_cog("FactionRoster")
 
-    def sync_member_cache_from_roster(self):
-        roster = self.get_roster()
-        if not roster or not roster.members_by_id:
-            return False
-        new_name_cache = set()
-        new_member_cache = {}
-        for user_id, row in roster.members_by_id.items():
-            new_name_cache.add(row["name_norm"])
-            raw = row.get("raw") or {
-                "id": user_id,
-                "name": row["name"],
-                "position": row.get("position"),
-                "days_in_faction": row.get("days_in_faction"),
-                "is_in_oc": row.get("is_in_oc"),
-                "status": {"state": row.get("status_state"), "description": row.get("status_description")},
-            }
-            new_member_cache[int(user_id)] = raw
-        self.active_members_cache = new_name_cache
-        self.member_status_cache = new_member_cache
-        self.last_member_refresh = roster.last_member_refresh
-        return True
-
     def member_is_abroad(self, member):
-        state = str((member.get("status") or {}).get("state") or "").strip().lower()
+        raw = member.get("raw") or {}
+        status = raw.get("status") if isinstance(raw.get("status"), dict) else {}
+        state = str(status.get("state") or member.get("status_state") or "").strip().lower()
         return state in ABROAD_STATES
 
-    async def fetch_json(self, url: str, timeout_seconds: int = 15):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=timeout_seconds) as response:
-                response.raise_for_status()
-                return await response.json()
-
-    async def fetch_faction_members(self):
-        if self.sync_member_cache_from_roster():
-            return len(self.active_members_cache)
-        try:
-            data = await self.fetch_json(self.build_torn_url(FACTION_MEMBERS_URL))
-            members_list = data.get("members", [])
-            new_name_cache, new_member_cache = set(), {}
-            for member in members_list:
-                name, member_id = member.get("name"), member.get("id")
-                if name and member_id:
-                    new_name_cache.add(self.normalize_username(name))
-                    new_member_cache[int(member_id)] = member
-            self.active_members_cache = new_name_cache
-            self.member_status_cache = new_member_cache
-            self.last_member_refresh = self.utc_now()
-            print(f"[Strike] Loaded {len(new_name_cache)} members (direct API).")
-            return len(self.active_members_cache)
-        except Exception as e:
-            print(f"[Strike] Error fetching members: {e}")
-            return 0
-
-    async def fetch_faction_crimes(self):
+    async def monitor_oc_delays(self):
         roster = self.get_roster()
-        if roster and roster.active_crimes:
-            self.last_crime_refresh = roster.last_crime_refresh
-            return roster.active_crimes
-        try:
-            data = await self.fetch_json(
-                self.build_torn_url(FACTION_CRIMES_URL, extra_params={"cat": "available"})
-            )
-            self.last_crime_refresh = self.utc_now()
-            crimes = data.get("crimes", []) or []
-            print(f"[Strike] Loaded {len(crimes)} available crimes (direct API).")
-            return crimes
-        except Exception as e:
-            print(f"[Strike] Error fetching crimes: {e}")
-            return []
+        if not roster:
+            log.warning("[Strike] Faction roster is not loaded.")
+            return
+        crimes = roster.active_crimes or []
+        now_ts = int(self.utc_now().timestamp())
+        delay_seconds = AUTO_STRIKE_DELAY_HOURS * 3600
+        for crime in crimes:
+            ready_at = crime.get("ready_at")
+            crime_id = crime.get("id")
+            if not ready_at or not crime_id:
+                continue
+            try:
+                ready_at_int = int(ready_at)
+            except (TypeError, ValueError):
+                continue
+            if now_ts <= ready_at_int + delay_seconds:
+                continue
+            status = str(crime.get("status") or "").strip().lower()
+            if status != "planning":
+                continue
+            for slot in crime.get("slots", []) or []:
+                user = slot.get("user") or {}
+                user_id = user.get("id")
+                if not user_id:
+                    continue
+                already = self.db_operation(
+                    "SELECT 1 FROM oc_delay_incidents WHERE crime_id = ? AND user_id = ?",
+                    (crime_id, user_id),
+                    fetch=True,
+                )
+                if already:
+                    continue
+                member = roster.get_member(int(user_id))
+                if not member:
+                    log.info(f"[Strike] Delay on crime {crime_id} but member {user_id} not in roster.")
+                    continue
+                if not self.member_is_abroad(member):
+                    continue
+                reason = (
+                    f"Automatic strike for delaying OC {crime_id} "
+                    f"({crime.get('name', 'Unknown')}) while abroad/traveling."
+                )
+                await self._issue_strike_logic(
+                    member.get("name", str(user_id)),
+                    reason=reason,
+                    performer_display="**AUTOMATED**",
+                    user_id=int(user_id),
+                )
+                self.db_operation(
+                    """INSERT OR IGNORE INTO oc_delay_incidents
+                       (crime_id, user_id, game_username, crime_name, ready_at, detected_at, strike_issued_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        crime_id,
+                        user_id,
+                        member.get("name"),
+                        crime.get("name") or "Unknown",
+                        ready_at_int,
+                        self.utc_now_iso(),
+                        self.utc_now_iso(),
+                    ),
+                )
 
     async def report_action(
         self,
@@ -313,7 +250,7 @@ class StrikeCommands(commands.Cog):
         root = load_root_settings()
         spam_channel = self.bot.get_channel(int(root.get("SPAM_CHANNEL_ID") or 0))
         if not spam_channel:
-            print("[Strike] SPAM_CHANNEL_ID not found.")
+            log.warning("[Strike] SPAM_CHANNEL_ID not found.")
             return False
         tag_roles = set(root.get("ROLES_TO_TAG") or [])
         role_mentions = [
@@ -330,7 +267,7 @@ class StrikeCommands(commands.Cog):
             await spam_channel.send(report_message)
             return True
         except Exception as e:
-            print(f"[Strike] Failed to report action: {e}")
+            log.error(f"[Strike] Failed to report action: {e}")
             return False
 
     async def _issue_strike_logic(
@@ -365,14 +302,15 @@ class StrikeCommands(commands.Cog):
                     ephemeral=True,
                 )
             except Exception as e:
-                print(f"[Strike] followup failed: {e}")
+                log.error(f"[Strike] followup failed: {e}")
         return success
 
     async def automated_strike_cleanup(self):
         rows = self.db_operation("SELECT DISTINCT game_username FROM strikes", fetch=True) or []
-        struck_users = {row[0].lower() for row in rows}
-        for user in struck_users:
-            if user not in self.active_members_cache:
+        roster = self.get_roster()
+        names = roster.known_names() if roster else set()
+        for user in {row[0].lower() for row in rows}:
+            if names and user not in names:
                 initial_count = self.db_operation(
                     "SELECT COUNT(*) FROM strikes WHERE game_username = ?",
                     (user,),
@@ -387,71 +325,8 @@ class StrikeCommands(commands.Cog):
                     defined_message="Cleared due to faction departure.",
                 )
 
-    async def monitor_oc_delays(self):
-        await self.fetch_faction_members()
-        crimes = await self.fetch_faction_crimes()
-        now_ts = int(self.utc_now().timestamp())
-        delay_seconds = AUTO_STRIKE_DELAY_HOURS * 3600
-        for crime in crimes:
-            ready_at = crime.get("ready_at")
-            crime_id = crime.get("id")
-            if not ready_at or not crime_id:
-                continue
-            try:
-                ready_at_int = int(ready_at)
-            except (TypeError, ValueError):
-                continue
-            if now_ts <= ready_at_int + delay_seconds:
-                continue
-            status = str(crime.get("status") or "").strip().lower()
-            if status != "planning":
-                continue
-            for slot in crime.get("slots", []) or []:
-                user = slot.get("user") or {}
-                user_id = user.get("id")
-                if not user_id:
-                    continue
-                already = self.db_operation(
-                    "SELECT 1 FROM oc_delay_incidents WHERE crime_id = ? AND user_id = ?",
-                    (crime_id, user_id),
-                    fetch=True,
-                )
-                if already:
-                    continue
-                member = self.member_status_cache.get(int(user_id))
-                if not member:
-                    print(f"[Strike] Delay on crime {crime_id} but member {user_id} not in cache.")
-                    continue
-                if not self.member_is_abroad(member):
-                    continue
-                reason = (
-                    f"Automatic strike for delaying OC {crime_id} "
-                    f"({crime.get('name', 'Unknown')}) while abroad/traveling."
-                )
-                await self._issue_strike_logic(
-                    member.get("name", str(user_id)),
-                    reason=reason,
-                    performer_display="**AUTOMATED**",
-                    user_id=int(user_id),
-                )
-                self.db_operation(
-                    """INSERT OR IGNORE INTO oc_delay_incidents
-                       (crime_id, user_id, game_username, crime_name, ready_at, detected_at, strike_issued_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        crime_id,
-                        user_id,
-                        member.get("name"),
-                        crime.get("name") or "Unknown",
-                        ready_at_int,
-                        self.utc_now_iso(),
-                        self.utc_now_iso(),
-                    ),
-                )
-
     @tasks.loop(hours=24.0)
     async def daily_task(self):
-        await self.fetch_faction_members()
         self.cleanup_old_records()
         await self.automated_strike_cleanup()
 
@@ -460,14 +335,13 @@ class StrikeCommands(commands.Cog):
         try:
             await self.monitor_oc_delays()
         except Exception as e:
-            print(f"[Strike] OC monitor failed: {e}")
+            log.error(f"[Strike] OC monitor failed: {e}")
 
     async def _wait_for_roster(self):
         await self.bot.wait_until_ready()
         roster = self.get_roster()
         if roster:
             await roster.wait_until_populated()
-        await self.fetch_faction_members()
         self.backfill_user_ids()
 
     @daily_task.before_loop
@@ -485,16 +359,17 @@ class StrikeCommands(commands.Cog):
             return await interaction.followup.send(
                 f"You need the **{self.allowed_role_name()}** role to use this.", ephemeral=True
             )
-        await self.fetch_faction_members()
-        if self.normalize_username(username) in self.active_members_cache:
+        roster = self.get_roster()
+        names = roster.known_names() if roster else set()
+        if self.normalize_username(username) in names:
             await self._issue_strike_logic(username, interaction)
             return
-        matches = difflib.get_close_matches(
-            self.normalize_username(username), self.active_members_cache, n=1
-        )
+        matches = difflib.get_close_matches(self.normalize_username(username), names, n=1)
         if matches:
-            view = FactionMemberView(interaction, self, username, matches[0])
-            await interaction.followup.send(f"Match found: `{matches[0]}`?", view=view, ephemeral=True)
+            await interaction.followup.send(
+                f"No exact member named `{username}`. Closest roster name is `{matches[0]}`.",
+                ephemeral=True,
+            )
         else:
             await interaction.followup.send("No user found in the current faction roster.", ephemeral=True)
 
@@ -568,7 +443,6 @@ class StrikeCommands(commands.Cog):
             return await interaction.followup.send(
                 f"You need the **{self.allowed_role_name()}** role to use this.", ephemeral=True
             )
-        await self.fetch_faction_members()
         self.backfill_user_ids()
         user_id = None
         display_name = username

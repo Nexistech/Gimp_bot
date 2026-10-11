@@ -17,6 +17,9 @@ from discord.ext import commands
 
 sys.path.append(os.getcwd())
 
+from plugin_log import get_logger
+log = get_logger("find_trader")
+
 try:
     from config import TORN_API_KEY
 except ImportError:
@@ -92,10 +95,10 @@ class FindTrader(commands.Cog):
                     response.raise_for_status()
                     data = await response.json()
         except (aiohttp.ClientError, TimeoutError) as exc:
-            print(f"[FindTrader] Item catalog fetch failed: {exc}")
+            log.error(f"[FindTrader] Item catalog fetch failed: {exc}")
             return {}
         if data.get("error"):
-            print(f"[FindTrader] Item catalog API error: {data['error']}")
+            log.error(f"[FindTrader] Item catalog API error: {data['error']}")
             return {}
         mapping = {}
         for raw_id, info in (data.get("items") or {}).items():

@@ -7,6 +7,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("daily_digest")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 PLUGIN_DIR = os.path.dirname(__file__)
@@ -291,9 +294,9 @@ class DailyDigest(commands.Cog):
         try:
             ok, err = await self.post_digest()
             if not ok:
-                print(f"[Digest] Skipped: {err}")
+                log.warning(f"[Digest] Skipped: {err}")
         except Exception as e:
-            print(f"[Digest] Failed: {e}")
+            log.error(f"[Digest] Failed: {e}")
 
     @digest_task.before_loop
     async def before_digest(self):

@@ -24,7 +24,7 @@ FEET = [
 
 
 class FindFeet(commands.Cog):
-    @app_commands.command(name="findfeet", description="A very serious lookup.")
+    @app_commands.command(name="findfeet", description="A very serious trader lookup.")
     async def findfeet(self, interaction: discord.Interaction):
         await interaction.response.send_message(random.choice(FEET), ephemeral=True)
 

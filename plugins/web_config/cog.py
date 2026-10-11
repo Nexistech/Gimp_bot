@@ -6,13 +6,15 @@ import logging
 import os
 import secrets
 import sys
-from logging.handlers import RotatingFileHandler
 
 import aiohttp
 from aiohttp import web
 from discord.ext import commands
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("web_config")
 from plugin_settings import (
     ROOT_SCHEMA,
     coerce_value,
@@ -26,32 +28,21 @@ from plugin_settings import (
 
 PLUGIN_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.getcwd()
-WEB_LOG_FILE = os.path.join(PLUGIN_DIR, "web_config.log")
 
 
 def setup_web_logging():
-    logger = logging.getLogger("aiohttp.access")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if not logger.handlers:
-        handler = RotatingFileHandler(WEB_LOG_FILE, maxBytes=500_000, backupCount=3)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        logger.addHandler(handler)
-    server = logging.getLogger("aiohttp.server")
-    server.setLevel(logging.WARNING)
-    server.propagate = False
-    if not server.handlers:
-        handler = RotatingFileHandler(WEB_LOG_FILE, maxBytes=500_000, backupCount=3)
-        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        server.addHandler(handler)
-    return logger
+    """Keep aiohttp off bot.log. The logging cog attaches logs/web_config.log."""
+    for name in ("aiohttp.access", "aiohttp.server"):
+        logger = logging.getLogger(name)
+        logger.propagate = False
+    return logging.getLogger("aiohttp.access")
 
 PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gimp Bot config</title>
+<title>Strike bot config</title>
 <style>
 :root { color-scheme: dark; }
 body { margin:0; font-family: system-ui, sans-serif; background:#101218; color:#e8eaed; }
@@ -111,7 +102,7 @@ class WebConfig(commands.Cog):
         try:
             await self.start_site()
         except Exception as exc:
-            print(f"[WebConfig] Failed to start: {exc}")
+            log.error(f"[WebConfig] Failed to start: {exc}")
 
     def cog_unload(self):
         if self.bot.loop.is_running():
@@ -198,7 +189,7 @@ class WebConfig(commands.Cog):
                 continue
             cls = "active" if item["id"] == active else ""
             links.append(f'<a class="{cls}" href="/plugin/{item["id"]}">{item["label"]}</a>')
-        return "<nav><h1>Gimp Bot</h1>" + "".join(links) + "</nav>"
+        return "<nav><h1>Strike bot</h1>" + "".join(links) + "</nav>"
 
     def roster(self):
         return self.bot.get_cog("FactionRoster")
@@ -546,7 +537,7 @@ class WebConfig(commands.Cog):
                 try:
                     cog.reload_settings(updated)
                 except Exception as exc:
-                    print(f"[WebConfig] reload_settings failed for {plugin_id}: {exc}")
+                    log.error(f"[WebConfig] reload_settings failed for {plugin_id}: {exc}")
             flash = "Saved. Some changes apply immediately; host/port need a reboot."
         return web.Response(text=render_page(self.form_body(item, flash)), content_type="text/html")
 
@@ -772,7 +763,7 @@ class WebConfig(commands.Cog):
                 await asyncio.sleep(0.4)
         if last_error:
             raise last_error
-        print(f"[WebConfig] Config UI on http://{host}:{port}")
+        log.info(f"[WebConfig] Config UI on http://{host}:{port}")
 
     async def stop_site(self):
         if self.site:
@@ -788,7 +779,7 @@ class WebConfig(commands.Cog):
             try:
                 await self.start_site()
             except Exception as exc:
-                print(f"[WebConfig] Failed to start: {exc}")
+                log.error(f"[WebConfig] Failed to start: {exc}")
 
 
 async def setup(bot: commands.Bot):

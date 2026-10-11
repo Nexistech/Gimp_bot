@@ -1,7 +1,8 @@
 """
-Example plugin �
+Example plugin — copy to plugins/example/cog.py and leave it disabled
+on the Plugins page until you want to see it load.
 
-Bot loads every folder under plugins/ that contains cog.py, unless
+StrikeBot loads every folder under plugins/ that contains cog.py, unless
 that folder is missing from ENABLED_PLUGINS in the root settings.json.
 
 Required hook:
@@ -9,10 +10,18 @@ Required hook:
         await bot.add_cog(YourCog(bot))
 
 Optional hooks the web UI looks for:
-    SETTINGS_SCHEMA	-	list of field dicts ->  plugins/example/settings.json
-    reload_settings	-	called after the config page is saved
-    web_tables		-	extra HTML tables on that plugin's page
-    web_action		-	POST handler for those tables
+    SETTINGS_SCHEMA  — list of field dicts → plugins/example/settings.json
+    reload_settings  — called after the config page is saved
+    web_tables       — extra HTML tables on that plugin's page
+    web_action       — POST handler for those tables
+
+Logging:
+    from plugin_log import get_logger
+    log = get_logger("example")
+    log.info("...") / log.warning / log.error / log.debug / log.trace
+    Nothing is written unless the logging plugin is enabled. Levels are
+    fatal, error, warning, info, debug, and trace, set on that plugin's page.
+    Do not print(); print goes into bot.log.
 """
 
 import datetime
@@ -26,6 +35,9 @@ from discord.ext import commands, tasks
 # Repo root is the process cwd. This lets "from config import ..." work
 # even though this file lives in plugins/example/.
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("example_plugin")
 
 from plugin_settings import load_root_settings, load_settings, save_settings, schema_defaults
 
@@ -99,7 +111,7 @@ class ExamplePlugin(commands.Cog):
 
     async def cog_load(self):
         """Runs on first load and on /reload. Good place to start a web server."""
-        print("[Example] cog_load")
+        log.info("[Example] cog_load")
 
     def cog_unload(self):
         """Always cancel tasks here or they keep running after /reload."""

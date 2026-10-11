@@ -37,7 +37,7 @@ build/
 *.sqlite3
 *.log
 *.log.*
-
+logs/
 # OS / editor junk
 .DS_Store
 Thumbs.db

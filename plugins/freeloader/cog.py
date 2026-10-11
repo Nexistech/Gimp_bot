@@ -7,6 +7,9 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("freeloader")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "freeloader_monitor.db")
@@ -57,7 +60,7 @@ class FreeloaderMonitor(commands.Cog):
                 return c.fetchall()
             conn.commit()
         except sqlite3.Error as e:
-            print(f"[Freeloader DB] Operation failed: {e}")
+            log.error(f"[Freeloader DB] Operation failed: {e}")
             return [] if fetch else None
         finally:
             conn.close()
@@ -105,7 +108,7 @@ class FreeloaderMonitor(commands.Cog):
         channel_id = int(root.get("FREELOADER_CHANNEL_ID") or root.get("SPAM_CHANNEL_ID") or 0)
         channel = self.bot.get_channel(channel_id)
         if channel is None:
-            print("[Freeloader] Channel not found.")
+            log.warning("[Freeloader] Channel not found.")
             return False
         role_mentions = []
         if channel.guild:
@@ -125,7 +128,7 @@ class FreeloaderMonitor(commands.Cog):
     async def daily_freeloader_check(self):
         roster = self.get_roster()
         if not roster or not roster.members_by_id:
-            print("[Freeloader] Roster empty; skipping check.")
+            log.warning("[Freeloader] Roster empty; skipping check.")
             return
         try:
             now_ts = int(utc_now().timestamp())
@@ -169,7 +172,7 @@ class FreeloaderMonitor(commands.Cog):
                         if await self.post_message(msg):
                             self.record_notification(user_id, username, "move_to_freeloader", last_completed_at)
         except Exception as e:
-            print(f"[Freeloader] Daily check failed: {e}")
+            log.error(f"[Freeloader] Daily check failed: {e}")
 
     @daily_freeloader_check.before_loop
     async def before_daily_freeloader_check(self):

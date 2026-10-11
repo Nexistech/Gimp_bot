@@ -16,6 +16,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("watchdog")
 from plugin_settings import enabled_plugins, load_root_settings, load_settings, plugin_folders, schema_defaults
 
 PLUGIN_DIR = os.path.dirname(__file__)
@@ -332,7 +335,7 @@ class Watchdog(commands.Cog):
             return
         channel_id = int(self.settings.get("alert_channel_id") or 0)
         if not channel_id:
-            print("[Watchdog] " + "; ".join(data["problems"]))
+            log.info("[Watchdog] " + "; ".join(data["problems"]))
             return
         channel = self.bot.get_channel(channel_id)
         if not channel:
@@ -340,7 +343,7 @@ class Watchdog(commands.Cog):
         try:
             await channel.send(embed=self.overview_embed(data))
         except discord.HTTPException as exc:
-            print(f"[Watchdog] Alert send failed: {exc}")
+            log.error(f"[Watchdog] Alert send failed: {exc}")
 
     @scan_task.before_loop
     async def before_scan(self):

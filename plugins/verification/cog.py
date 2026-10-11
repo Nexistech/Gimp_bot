@@ -10,6 +10,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("verification")
 from plugin_settings import load_root_settings, load_settings, save_settings, schema_defaults
 
 try:
@@ -276,8 +279,8 @@ class Verification(commands.Cog):
                     }
         if not TORN_API_KEY:
             return None
-        url = f"https://api.torn.com/user/{int(discord_id)}?selections=discord,profile,basic&key={TORN_API_KEY}&comment=GimpBot"
-        headers = {"User-Agent": "GimpBot/1.0"}
+        url = f"https://api.torn.com/user/{int(discord_id)}?selections=discord,profile,basic&key={TORN_API_KEY}&comment=StrikeBot"
+        headers = {"User-Agent": "StrikeBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=20) as response:
                 data = await response.json()
@@ -358,12 +361,12 @@ class Verification(commands.Cog):
             try:
                 await member.remove_roles(*plan["remove"], reason=reason)
             except discord.HTTPException as exc:
-                print(f"[Verify] remove_roles failed: {exc}")
+                log.error(f"[Verify] remove_roles failed: {exc}")
         if plan["add"]:
             try:
                 await member.add_roles(*plan["add"], reason=reason)
             except discord.HTTPException as exc:
-                print(f"[Verify] add_roles failed: {exc}")
+                log.error(f"[Verify] add_roles failed: {exc}")
         if plan["nick"]:
             try:
                 await member.edit(nick=plan["nick"], reason=reason)
@@ -453,12 +456,12 @@ class Verification(commands.Cog):
             try:
                 await member.remove_roles(*plan["remove"], reason=plan["reason"])
             except discord.HTTPException as exc:
-                print(f"[Verify] remove_roles failed: {exc}")
+                log.error(f"[Verify] remove_roles failed: {exc}")
         if plan["add"]:
             try:
                 await member.add_roles(*plan["add"], reason=plan["reason"])
             except discord.HTTPException as exc:
-                print(f"[Verify] add_roles failed: {exc}")
+                log.error(f"[Verify] add_roles failed: {exc}")
         if plan["nick"]:
             try:
                 await member.edit(nick=plan["nick"], reason=plan["reason"])

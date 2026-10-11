@@ -8,6 +8,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("oc_nudge")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 DB_NAME = os.path.join(os.path.dirname(__file__), "oc_nudge.db")
@@ -75,7 +78,7 @@ class OCNudgeMonitor(commands.Cog):
                 return c.fetchall()
             conn.commit()
         except sqlite3.Error as e:
-            print(f"[OC Nudge DB] Operation failed: {e}")
+            log.error(f"[OC Nudge DB] Operation failed: {e}")
             return [] if fetch else None
         finally:
             conn.close()
@@ -158,18 +161,18 @@ class OCNudgeMonitor(commands.Cog):
         try:
             await self._run_nudges()
         except Exception as e:
-            print(f"[OC Nudge] Task failed: {e}")
+            log.error(f"[OC Nudge] Task failed: {e}")
 
     async def _run_nudges(self):
         roster = self.get_roster()
         if not roster or not roster.members_by_id:
-            print("[OC Nudge] Roster empty; skipping.")
+            log.warning("[OC Nudge] Roster empty; skipping.")
             return
         root = load_root_settings()
         channel_id = int(root.get("SPAM_CHANNEL_ID") or 0)
         channel = self.bot.get_channel(channel_id)
         if not channel:
-            print(f"[OC Nudge] SPAM_CHANNEL_ID ({channel_id}) not found.")
+            log.warning(f"[OC Nudge] SPAM_CHANNEL_ID ({channel_id}) not found.")
             return
         ignored_ids = self.get_ignored_ids()
         now_ts = int(utc_now().timestamp())
@@ -212,7 +215,7 @@ class OCNudgeMonitor(commands.Cog):
                 await channel.send(content=content, embed=embed)
                 self.record_nudge(user_id, last_ts)
             except discord.Forbidden:
-                print(f"[OC Nudge] Forbidden sending to {channel_id}.")
+                log.error(f"[OC Nudge] Forbidden sending to {channel_id}.")
                 return
 
     @nudge_task.before_loop

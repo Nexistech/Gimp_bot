@@ -7,6 +7,9 @@ import discord
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
+
+from plugin_log import get_logger
+log = get_logger("oc_cpr")
 from plugin_settings import load_root_settings, load_settings, schema_defaults
 
 PLUGIN_DIR = os.path.dirname(__file__)
@@ -211,7 +214,7 @@ class OCCPRMonitor(commands.Cog):
         root = load_root_settings()
         channel = self.bot.get_channel(int(root.get("SPAM_CHANNEL_ID") or 0))
         if not channel:
-            print("[OC CPR] Spam channel not found.")
+            log.warning("[OC CPR] Spam channel not found.")
             return False
         roster = self.get_roster()
         lines = []
@@ -257,7 +260,7 @@ class OCCPRMonitor(commands.Cog):
             await channel.send(content=" ".join(seen) if seen else None, embed=embed)
             return True
         except discord.Forbidden:
-            print("[OC CPR] Forbidden sending CPR alert.")
+            log.error("[OC CPR] Forbidden sending CPR alert.")
             return False
 
     @tasks.loop(minutes=10)
