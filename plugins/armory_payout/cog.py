@@ -590,9 +590,12 @@ class ArmoryPayout(commands.Cog):
             "payor": match.group("payor").strip(),
         }
 
-    def settle_deposit(self, deposit, payday):
+    def settle_deposits(self, deposits, payday):
+        if not deposits:
+            return None
         note = f"{payday.get('id') or ''}\n{payday.get('text') or ''}"[:500]
         now_ts = int(utc_now().timestamp())
+        first = deposits[0]
         conn = self.db()
         cursor = conn.execute(
             """
@@ -600,24 +603,36 @@ class ArmoryPayout(commands.Cog):
             VALUES (?, ?, ?, NULL, ?, ?, 'paid', ?)
             """,
             (
-                deposit.get("torn_id"),
-                deposit.get("torn_name"),
+                first.get("torn_id"),
+                first.get("torn_name"),
                 int(payday["amount"]),
                 now_ts,
                 now_ts,
                 note,
             ),
         )
+        payout_id = cursor.lastrowid
+        ids = [int(deposit["id"]) for deposit in deposits]
+        placeholders = ",".join("?" for _ in ids)
         conn.execute(
-            """
+            f"""
             UPDATE deposits
             SET status = 'paid', payout_id = ?
-            WHERE id = ? AND status IN ('unpaid', 'pending')
+            WHERE id IN ({placeholders}) AND status IN ('unpaid', 'pending')
             """,
-            (cursor.lastrowid, deposit["id"]),
+            [payout_id, *ids],
         )
+        if payday.get("id"):
+            conn.execute(
+                "UPDATE pay_notes SET deposit_id = ? WHERE news_id = ? AND deposit_id IS NULL",
+                (payout_id, str(payday["id"])),
+            )
         conn.commit()
         conn.close()
+        return payout_id
+
+    def settle_deposit(self, deposit, payday):
+        return self.settle_deposits([deposit], payday)
 
     def save_pay_note(self, payday, torn_id, torn_name):
         conn = self.db()
@@ -670,6 +685,7 @@ class ArmoryPayout(commands.Cog):
             return []
         async with self._scan_lock:
             await self.fill_missing_ranges()
+            self.reconcile_pay_notes()
             news = await self.fetch_give_funds()
             used = self.used_payday_ids()
             conn = self.db()
@@ -703,10 +719,29 @@ class ArmoryPayout(commands.Cog):
                     **parsed,
                 }
                 name_key = parsed["name"].casefold()
+                member_deposits = [
+                    deposit
+                    for deposit in open_deposits
+                    if str(deposit.get("torn_name") or "").casefold() == name_key
+                ]
+                total_owed = sum(int(deposit.get("total") or 0) for deposit in member_deposits)
+                if (
+                    member_deposits
+                    and total_owed > 0
+                    and abs(parsed["amount"] - total_owed) <= max(1, int(total_owed * AMOUNT_TOLERANCE))
+                ):
+                    self.settle_deposits(member_deposits, payday)
+                    paid_ids = {deposit["id"] for deposit in member_deposits}
+                    open_deposits = [deposit for deposit in open_deposits if deposit["id"] not in paid_ids]
+                    used.add(news_id)
+                    actions.append(("paid", member_deposits[0].get("torn_id"), payday))
+                    log.info(
+                        f"[ArmoryPayout] Payday {format_money(parsed['amount'])} cleared "
+                        f"{len(member_deposits)} deposit(s) for {parsed['name']}."
+                    )
+                    continue
                 matches = []
-                for deposit in open_deposits:
-                    if str(deposit.get("torn_name") or "").casefold() != name_key:
-                        continue
+                for deposit in member_deposits:
                     low, high = self.deposit_bounds(deposit)
                     if high > 0 and low <= parsed["amount"] <= high:
                         matches.append(deposit)
@@ -733,6 +768,48 @@ class ArmoryPayout(commands.Cog):
                 used.add(news_id)
                 actions.append(("note", donor_ids[name_key], payday))
             return actions
+
+    def reconcile_pay_notes(self):
+        """A payday already saved as a note can still be the full balance."""
+        conn = self.db()
+        notes = conn.execute(
+            "SELECT * FROM pay_notes WHERE deposit_id IS NULL ORDER BY paid_at"
+        ).fetchall()
+        conn.close()
+        for note in notes:
+            if not note["torn_id"]:
+                continue
+            conn = self.db()
+            deposits = conn.execute(
+                """
+                SELECT * FROM deposits
+                WHERE torn_id = ? AND status IN ('unpaid', 'pending')
+                ORDER BY deposited_at
+                """,
+                (int(note["torn_id"]),),
+            ).fetchall()
+            conn.close()
+            deposits = [dict(row) for row in deposits]
+            total_owed = sum(int(deposit.get("total") or 0) for deposit in deposits)
+            amount = int(note["amount"] or 0)
+            if len(deposits) < 1 or total_owed <= 0:
+                continue
+            if abs(amount - total_owed) > max(1, int(total_owed * AMOUNT_TOLERANCE)):
+                continue
+            self.settle_deposits(
+                deposits,
+                {
+                    "id": note["news_id"],
+                    "text": "",
+                    "amount": amount,
+                    "timestamp": note["paid_at"],
+                    "payor": note["payor"],
+                },
+            )
+            log.info(
+                f"[ArmoryPayout] Note {format_money(amount)} cleared "
+                f"{len(deposits)} deposit(s) for {note['torn_name']}."
+            )
 
     async def fetch_give_funds(self):
         url = (
@@ -1128,6 +1205,8 @@ class ArmoryPayout(commands.Cog):
                 f"removing {format_money(owed)}.",
                 ephemeral=True,
             )
+        if staff:
+            self.reconcile_pay_notes()
         if staff and member:
             target = self.member_for_query(member)
             if not target:
@@ -1155,16 +1234,7 @@ class ArmoryPayout(commands.Cog):
                         f"**{row['torn_name']}** [{row['torn_id'] or '?'}] is owed **{format_money(row['owed'])}**."
                     )
                     lines.extend(self.note_lines(row["torn_id"]))
-            shown = {int(row["torn_id"]) for row in rows if row["torn_id"]}
-            for note in self.noted_members():
-                torn_id = int(note["torn_id"])
-                if torn_id in shown:
-                    continue
-                if lines:
-                    lines.append("")
-                lines.append(f"**{note['torn_name']}** [{torn_id}] is owed **$0**.")
-                lines.extend(self.note_lines(torn_id))
-            if not mine and not others and not lines:
+            if not mine and not others:
                 return await interaction.followup.send("Nobody is owed a payout.", ephemeral=True)
             lines.append("\nUse `/payout member:` to see the items and mark one paid.")
             return await interaction.followup.send("\n".join(lines), ephemeral=True)
