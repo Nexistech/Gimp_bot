@@ -228,7 +228,18 @@ class DailyDigest(commands.Cog):
             "delayed_ocs": delayed_ocs,
             "missing_tools": missing_tools,
             "cpr_issues": cpr_issues,
+            "freeloader_tenure": self.freeloader_tenure_lines(),
         }
+
+    def freeloader_tenure_lines(self):
+        cog = self.bot.get_cog("FreeloaderMonitor")
+        if not cog:
+            return []
+        try:
+            return cog.tenure_lines()
+        except Exception as exc:
+            log.error(f"[Digest] Freeloader tenure failed: {exc}")
+            return []
 
     def build_embed(self, data):
         embed = discord.Embed(
@@ -249,6 +260,11 @@ class DailyDigest(commands.Cog):
         embed.add_field(
             name=f"Idle {FREELOADER_IDLE_DAYS}+ days (not Freeloader)",
             value=self.format_list(data["idle"]),
+            inline=False,
+        )
+        embed.add_field(
+            name="Freeloader tenure",
+            value=self.format_list(data.get("freeloader_tenure") or []),
             inline=False,
         )
         embed.add_field(

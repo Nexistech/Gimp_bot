@@ -41,12 +41,14 @@ class FreeloaderMonitor(commands.Cog):
         self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.initialize_db()
         self.daily_freeloader_check.start()
+        self.tenure_sync.start()
 
     def reload_settings(self, data=None):
         self.settings = data or load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
 
     def cog_unload(self):
         self.daily_freeloader_check.cancel()
+        self.tenure_sync.cancel()
 
     def get_roster(self):
         return self.bot.get_cog("FactionRoster")
@@ -74,6 +76,17 @@ class FreeloaderMonitor(commands.Cog):
                 last_completed_crime_at INTEGER,
                 last_warning_type TEXT NOT NULL,
                 last_warning_at TEXT NOT NULL
+            )
+            """
+        )
+        self.db_operation(
+            """
+            CREATE TABLE IF NOT EXISTS freeloader_tenure (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                game_username TEXT,
+                since_ts INTEGER NOT NULL,
+                ended_ts INTEGER
             )
             """
         )
@@ -123,6 +136,89 @@ class FreeloaderMonitor(commands.Cog):
             return True
         except discord.Forbidden:
             return False
+
+    def sync_tenure(self):
+        """Remember when each current freeloader was first seen in that rank."""
+        roster = self.get_roster()
+        if not roster or not roster.members_by_id:
+            return []
+        position_name = str(self.settings.get("position_name") or "Freeloader").casefold()
+        now_ts = int(utc_now().timestamp())
+        current = {}
+        for member in roster.all_members():
+            if str(member.get("position") or "").strip().casefold() != position_name:
+                continue
+            try:
+                user_id = int(member.get("id") or member.get("user_id"))
+            except (TypeError, ValueError):
+                continue
+            current[user_id] = member.get("name") or "Unknown"
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row
+        open_rows = conn.execute(
+            "SELECT id, user_id FROM freeloader_tenure WHERE ended_ts IS NULL"
+        ).fetchall()
+        open_by_user = {int(row["user_id"]): int(row["id"]) for row in open_rows}
+        for user_id, name in current.items():
+            if user_id in open_by_user:
+                conn.execute(
+                    "UPDATE freeloader_tenure SET game_username = ? WHERE id = ?",
+                    (name, open_by_user[user_id]),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO freeloader_tenure (user_id, game_username, since_ts, ended_ts)
+                    VALUES (?, ?, ?, NULL)
+                    """,
+                    (user_id, name, now_ts),
+                )
+        for user_id, row_id in open_by_user.items():
+            if user_id not in current:
+                conn.execute(
+                    "UPDATE freeloader_tenure SET ended_ts = ? WHERE id = ? AND ended_ts IS NULL",
+                    (now_ts, row_id),
+                )
+        rows = conn.execute(
+            """
+            SELECT user_id, game_username, since_ts
+            FROM freeloader_tenure
+            WHERE ended_ts IS NULL
+            ORDER BY since_ts
+            """
+        ).fetchall()
+        conn.commit()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def tenure_lines(self):
+        now_ts = int(utc_now().timestamp())
+        lines = []
+        for row in self.sync_tenure():
+            since_ts = int(row["since_ts"] or now_ts)
+            elapsed = max(0, now_ts - since_ts)
+            days = elapsed // 86400
+            if days >= 1:
+                age = f"{days}d"
+            else:
+                age = f"{max(1, elapsed // 3600)}h"
+            since = datetime.datetime.fromtimestamp(since_ts, datetime.timezone.utc).strftime("%Y-%m-%d")
+            lines.append(f"• `{row['game_username']}` [{row['user_id']}] — {age} (since {since})")
+        return lines
+
+    @tasks.loop(minutes=30)
+    async def tenure_sync(self):
+        try:
+            self.sync_tenure()
+        except Exception as exc:
+            log.error(f"[Freeloader] Tenure sync failed: {exc}")
+
+    @tenure_sync.before_loop
+    async def before_tenure_sync(self):
+        await self.bot.wait_until_ready()
+        roster = self.get_roster()
+        if roster:
+            await roster.wait_until_populated()
 
     @tasks.loop(hours=24.0)
     async def daily_freeloader_check(self):
