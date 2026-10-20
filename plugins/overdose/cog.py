@@ -187,6 +187,8 @@ class OverdoseMonitor(commands.Cog):
             conn.execute("ALTER TABLE od_counts ADD COLUMN api_total INTEGER")
         if "stats_json" not in cols:
             conn.execute("ALTER TABLE od_counts ADD COLUMN stats_json TEXT")
+        if "checked_at" not in cols:
+            conn.execute("ALTER TABLE od_counts ADD COLUMN checked_at INTEGER")
         existing = conn.execute("SELECT COUNT(*) FROM od_comments").fetchone()[0]
         if existing == 0:
             conn.executemany("INSERT INTO od_comments (text) VALUES (?)", [(c,) for c in DEFAULT_COMMENTS])
@@ -351,15 +353,30 @@ class OverdoseMonitor(commands.Cog):
             return
         interval = max(1, int(self.settings.get("check_minutes") or 5))
         batch = min(20, max(1, -(-len(members) * interval // SWEEP_MINUTES)))
+        now_ts = int(utc_now().timestamp())
+        due_before = now_ts - (SWEEP_MINUTES * 60)
+        conn = self.db()
+        known = {
+            int(row["user_id"]): row["checked_at"]
+            for row in conn.execute("SELECT user_id, checked_at FROM od_counts")
+        }
+        conn.close()
+        due = []
+        for user_id, name in members:
+            checked_at = known.get(user_id)
+            if checked_at is None or int(checked_at) <= due_before:
+                due.append((int(checked_at or 0), user_id, name))
+        due.sort()
+        picked = [(user_id, name) for _checked, user_id, name in due[:batch]]
+        if not picked:
+            return
         sweep_minutes = len(members) / batch * interval
         if sweep_minutes > 45:
             log.warning(
                 f"[Overdose] Roster sweep is about {sweep_minutes:.0f} min, "
                 "longer than the 45 min ketamine cooldown."
             )
-        start = getattr(self, "_cursor", 0) % len(members)
-        picked = [members[(start + offset) % len(members)] for offset in range(min(batch, len(members)))]
-        self._cursor = start + len(picked)
+        log.info(f"[Overdose] {len(due)} member(s) due, checking {len(picked)}")
         headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             for user_id, name in picked:
@@ -379,6 +396,7 @@ class OverdoseMonitor(commands.Cog):
                         old_stats = json.loads(row["stats_json"])
                     except (TypeError, ValueError):
                         old_stats = None
+                pulled_at = int(utc_now().timestamp())
                 blob = json.dumps({key: int(stats.get(key) or 0) for key, _label in DRUG_FIELDS})
                 if previous is None or old_stats is None:
                     year = utc_now().year
@@ -387,23 +405,24 @@ class OverdoseMonitor(commands.Cog):
                     conn.execute(
                         """
                         INSERT INTO od_counts
-                            (user_id, name, total, year, year_count, lifetime_fetched, api_total, stats_json)
-                        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                            (user_id, name, total, year, year_count, lifetime_fetched, api_total, stats_json, checked_at)
+                        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
                         ON CONFLICT(user_id) DO UPDATE SET
                             name=excluded.name,
                             api_total=excluded.api_total,
                             stats_json=excluded.stats_json,
+                            checked_at=excluded.checked_at,
                             lifetime_fetched=1
                         """,
-                        (user_id, name, stored_total, year, year_count, count, blob),
+                        (user_id, name, stored_total, year, year_count, count, blob, pulled_at),
                     )
                     conn.commit()
                     conn.close()
                     await asyncio.sleep(0.4)
                     continue
                 conn.execute(
-                    "UPDATE od_counts SET name = ?, api_total = ?, stats_json = ? WHERE user_id = ?",
-                    (name, count, blob, user_id),
+                    "UPDATE od_counts SET name = ?, api_total = ?, stats_json = ?, checked_at = ? WHERE user_id = ?",
+                    (name, count, blob, pulled_at, user_id),
                 )
                 if count <= previous:
                     conn.commit()
@@ -442,7 +461,7 @@ class OverdoseMonitor(commands.Cog):
     def web_tables(self):
         conn = self.db()
         counts = conn.execute(
-            "SELECT user_id, name, year_count, total, lifetime_fetched FROM od_counts ORDER BY total DESC, name"
+            "SELECT user_id, name, year_count, total, lifetime_fetched, api_total, stats_json, checked_at FROM od_counts ORDER BY name"
         ).fetchall()
         comments = conn.execute("SELECT id, text FROM od_comments ORDER BY id").fetchall()
         conn.close()
@@ -456,6 +475,30 @@ class OverdoseMonitor(commands.Cog):
             }
             for row in counts
         ]
+        drug_columns = ["Member", "Overdoses"] + [label for _key, label in DRUG_FIELDS] + ["Total taken", "Last pull"]
+        drug_rows = []
+        for row in counts:
+            try:
+                stats = json.loads(row["stats_json"]) if row["stats_json"] else None
+            except (TypeError, ValueError):
+                stats = None
+            entry = {"Member": row["name"] or row["user_id"]}
+            entry["Overdoses"] = "" if row["api_total"] is None else int(row["api_total"])
+            taken = 0
+            for key, label in DRUG_FIELDS:
+                if not stats:
+                    entry[label] = ""
+                else:
+                    entry[label] = int(stats.get(key) or 0)
+                    taken += entry[label]
+            entry["Total taken"] = "" if not stats else taken
+            if row["checked_at"]:
+                entry["Last pull"] = datetime.datetime.fromtimestamp(
+                    int(row["checked_at"]), datetime.timezone.utc
+                ).strftime("%Y-%m-%d %H:%M")
+            else:
+                entry["Last pull"] = ""
+            drug_rows.append(entry)
         comment_rows = [{"id": row["id"], "Comment": row["text"]} for row in comments]
         count_form = """
         <form method="post" action="/plugin/__PLUGIN__/action">
@@ -475,6 +518,13 @@ class OverdoseMonitor(commands.Cog):
         </form>
         """
         return [
+            {
+                "title": "Drug use",
+                "note": "Click a column heading to sort. Counts appear as the roster scan stores them.",
+                "sortable": True,
+                "columns": drug_columns,
+                "rows": drug_rows,
+            },
             {
                 "title": "Stored overdose counts",
                 "columns": ["Member", "This year", "All time", "API seeded"],
