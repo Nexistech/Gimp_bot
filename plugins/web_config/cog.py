@@ -65,7 +65,11 @@ table.sheet { min-width:1080px; margin-top:0; }
 table.sheet th { cursor:pointer; user-select:none; white-space:nowrap; }
 table.sheet th.num, table.sheet td.num { text-align:right; font-variant-numeric:tabular-nums; }
 table.sheet th.sorted-asc::after { content:" \\25B2"; color:#8eb4ff; }
-table.sheet th.sorted-desc::after { content:" \\25BC"; color:#8eb4ff; }
+table.sheet tr.filters th { cursor:default; }
+table.sheet tr.filters input { margin:0; padding:4px 6px; font-weight:400; }
+.progress-wrap { margin:8px 0 14px; max-width:420px; }
+.progress-bar { height:16px; background:#2a3148; border-radius:8px; overflow:hidden; }
+.progress-bar span { display:block; height:100%; width:0; background:#4c6fff; }
 .row-btn { margin:0; background:#5a3148; padding:4px 8px; font-size:12px; }
 h3 { margin-top:36px; }
 .flash { background:#1e3a2f; border:1px solid #2e8b57; padding:10px 12px; border-radius:6px; margin-bottom:16px; }
@@ -474,11 +478,11 @@ class WebConfig(commands.Cog):
                 }}
               }});
             }});
-            document.querySelectorAll("table.sheet th").forEach((th) => {{
+            document.querySelectorAll("table.sheet thead tr:first-child th").forEach((th) => {{
               if (th.dataset.nosort) return;
               th.addEventListener("click", () => {{
                 const table = th.closest("table");
-                const headers = Array.from(table.querySelectorAll("thead th"));
+                const headers = Array.from(table.querySelectorAll("thead tr:first-child th"));
                 const index = headers.indexOf(th);
                 const tbody = table.querySelector("tbody");
                 const rows = Array.from(tbody.querySelectorAll("tr"));
@@ -502,6 +506,39 @@ class WebConfig(commands.Cog):
                   return asc ? cmp : -cmp;
                 }});
                 rows.forEach((row) => tbody.appendChild(row));
+              }});
+            }});
+            function cellMatches(shown, raw, query) {{
+              const op = query.match(/^(>=|<=|>|<|=)\\s*(-?\\d+(?:\\.\\d+)?)$/);
+              if (op) {{
+                const n = Number(String(raw).replace(/,/g, ""));
+                if (Number.isNaN(n)) return false;
+                const v = Number(op[2]);
+                if (op[1] === ">") return n > v;
+                if (op[1] === "<") return n < v;
+                if (op[1] === ">=") return n >= v;
+                if (op[1] === "<=") return n <= v;
+                return n === v;
+              }}
+              return String(shown).toLowerCase().includes(query.toLowerCase());
+            }}
+            document.querySelectorAll("table.sheet .col-filter").forEach((input) => {{
+              input.addEventListener("click", (ev) => ev.stopPropagation());
+              input.addEventListener("input", () => {{
+                const table = input.closest("table");
+                const inputs = table.querySelectorAll(".col-filter");
+                table.querySelectorAll("tbody tr").forEach((row) => {{
+                  let show = true;
+                  inputs.forEach((box) => {{
+                    const query = box.value.trim();
+                    if (!query || !show) return;
+                    const cell = row.children[Number(box.dataset.col)];
+                    if (!cell) {{ show = false; return; }}
+                    const raw = cell.dataset.sort ?? cell.textContent.trim();
+                    if (!cellMatches(cell.textContent.trim(), raw, query)) show = false;
+                  }});
+                  row.style.display = show ? "" : "none";
+                }});
               }});
             }});
             let timer = null;
@@ -648,7 +685,20 @@ class WebConfig(commands.Cog):
             note = html.escape(table.get("note") or "")
             note_html = f'<p class="help">{note}</p>' if note else ""
             table_class = "sheet" if sortable else ""
-            table_html = f'<table class="{table_class}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
+            filter_row = ""
+            if sortable:
+                boxes = []
+                for index, _col in enumerate(columns):
+                    boxes.append(
+                        f'<th><input class="col-filter" data-col="{index}" placeholder="Filter"></th>'
+                    )
+                if row_actions:
+                    boxes.append("<th></th>")
+                filter_row = '<tr class="filters">' + "".join(boxes) + "</tr>"
+            table_html = (
+                f'<table class="{table_class}"><thead><tr>{head}</tr>{filter_row}</thead>'
+                f"<tbody>{body}</tbody></table>"
+            )
             if sortable:
                 table_html = f'<div class="sheet-wrap">{table_html}</div>'
             blocks.append(f"<h3>{title}</h3>{note_html}{extra_form}{table_html}")
@@ -671,6 +721,20 @@ class WebConfig(commands.Cog):
         if request.headers.get("X-Requested-With") == "fetch":
             return web.json_response({"ok": ok, "message": message, "action": posted.get("action"), "id": posted.get("id")})
         return web.Response(text=render_page(self.form_body(item, message)), content_type="text/html")
+
+    async def handle_overdose_pull(self, request):
+        if not self.authorized(request):
+            raise web.HTTPUnauthorized()
+        cog = self.bot.get_cog("OverdoseMonitor")
+        if not cog:
+            return web.json_response({"running": False, "done": 0, "total": 0})
+        return web.json_response(
+            {
+                "running": bool(getattr(cog, "_pulling", False)),
+                "done": int(getattr(cog, "_pull_done", 0) or 0),
+                "total": int(getattr(cog, "_pull_total", 0) or 0),
+            }
+        )
 
     async def handle_roster_search(self, request):
         if not self.authorized(request):
@@ -802,6 +866,7 @@ class WebConfig(commands.Cog):
                 web.get("/api/channels", self.handle_channel_search),
                 web.get("/api/ranks", self.handle_rank_search),
                 web.get("/api/role-names", self.handle_role_name_search),
+                web.get("/api/overdose-pull", self.handle_overdose_pull),
             ]
         )
         host = str(self.settings.get("WEB_HOST") or "127.0.0.1")

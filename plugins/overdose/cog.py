@@ -136,6 +136,8 @@ class OverdoseMonitor(commands.Cog):
         self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.initialize_db()
         self._pulling = False
+        self._pull_done = 0
+        self._pull_total = 0
         self.check_task.start()
 
     def reload_settings(self, data=None):
@@ -388,9 +390,12 @@ class OverdoseMonitor(commands.Cog):
                 "longer than the 45 min ketamine cooldown."
             )
         log.info(f"[Overdose] {len(due)} member(s) due, checking {len(picked)}")
+        self._pull_total = len(picked)
+        self._pull_done = 0
         headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
-            for user_id, name in picked:
+            for index, (user_id, name) in enumerate(picked, start=1):
+                self._pull_done = index
                 try:
                     stats = await self.fetch_drug_stats(session, user_id)
                 except Exception as exc:
@@ -468,6 +473,7 @@ class OverdoseMonitor(commands.Cog):
                     except discord.HTTPException as exc:
                         log.error(f"[Overdose] Send failed: {exc}")
                 await asyncio.sleep(0.4)
+                self._pull_done = index
 
     @tasks.loop(minutes=5)
     async def check_task(self):
@@ -594,16 +600,20 @@ class OverdoseMonitor(commands.Cog):
         next_ts = int(nxt.timestamp()) if nxt else 0
         return f"""
         <p class="help">Next automatic pull <strong id="od-countdown" data-next="{next_ts}">...</strong></p>
-        <form method="post" action="/plugin/__PLUGIN__/action">
+        <div id="od-progress" class="progress-wrap" hidden>
+          <div class="progress-bar"><span id="od-progress-fill"></span></div>
+          <p class="help" id="od-progress-label">0/0</p>
+        </div>
+        <form id="od-pull-form" method="post" action="/plugin/__PLUGIN__/action">
           <input type="hidden" name="action" value="pull_now">
-          <button type="submit">Pull now</button>
+          <button type="submit" id="od-pull-now">Pull now</button>
         </form>
         <script>
         (function () {{
           const el = document.getElementById("od-countdown");
-          if (!el) return;
-          const next = Number(el.dataset.next || 0);
+          const next = Number((el && el.dataset.next) || 0);
           function tick() {{
+            if (!el) return;
             if (!next) {{ el.textContent = "is not scheduled yet"; return; }}
             const sec = Math.max(0, next - Math.floor(Date.now() / 1000));
             if (sec <= 0) {{ el.textContent = "is due now"; return; }}
@@ -613,6 +623,57 @@ class OverdoseMonitor(commands.Cog):
           }}
           tick();
           setInterval(tick, 1000);
+
+          const form = document.getElementById("od-pull-form");
+          const wrap = document.getElementById("od-progress");
+          const fill = document.getElementById("od-progress-fill");
+          const label = document.getElementById("od-progress-label");
+          const button = document.getElementById("od-pull-now");
+          let poll = null;
+          function paint(data) {{
+            const total = Number(data.total || 0);
+            const done = Number(data.done || 0);
+            const running = !!data.running;
+            if (!running && !total) return;
+            wrap.hidden = false;
+            const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
+            fill.style.width = pct + "%";
+            label.textContent = done + "/" + total + (running ? "" : " done — refresh to load the new numbers");
+            return running;
+          }}
+          async function refreshProgress() {{
+            const res = await fetch("/api/overdose-pull", {{credentials: "same-origin"}});
+            const data = await res.json();
+            const running = paint(data);
+            if (!running && poll) {{
+              clearInterval(poll);
+              poll = null;
+              button.disabled = false;
+            }}
+          }}
+          function startPoll() {{
+            if (poll) return;
+            poll = setInterval(refreshProgress, 1000);
+            refreshProgress();
+          }}
+          form.addEventListener("submit", async (ev) => {{
+            ev.preventDefault();
+            button.disabled = true;
+            wrap.hidden = false;
+            label.textContent = "Starting…";
+            fill.style.width = "0%";
+            const body = new URLSearchParams(new FormData(form));
+            await fetch(form.action, {{
+              method: "POST",
+              credentials: "same-origin",
+              headers: {{"X-Requested-With": "fetch"}},
+              body
+            }});
+            startPoll();
+          }});
+          fetch("/api/overdose-pull", {{credentials: "same-origin"}})
+            .then((res) => res.json())
+            .then((data) => {{ if (data.running) {{ button.disabled = true; startPoll(); }} }});
         }})();
         </script>
         """
