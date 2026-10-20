@@ -52,7 +52,7 @@ nav h1 { font-size:16px; margin:0 20px 16px; }
 nav a { display:block; padding:10px 20px; color:#c5c9d3; text-decoration:none; }
 nav a.active, nav a:hover { background:#2a3148; color:#fff; }
 nav .nav-label { margin:18px 20px 8px; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#8b93a7; }
-main { flex:1; padding:28px 32px; max-width:820px; }
+main { flex:1; padding:28px 32px; max-width:1400px; }
 label { display:block; margin:16px 0 6px; font-weight:600; }
 input, textarea { width:100%; box-sizing:border-box; padding:8px 10px; border-radius:6px;
   border:1px solid #3b4154; background:#0d0f14; color:#fff; }
@@ -60,6 +60,12 @@ input, textarea { width:100%; box-sizing:border-box; padding:8px 10px; border-ra
 button { margin-top:20px; background:#4c6fff; color:#fff; border:0; padding:10px 16px; border-radius:6px; cursor:pointer; }
 table { width:100%; border-collapse:collapse; margin-top:12px; font-size:14px; }
 th, td { text-align:left; padding:8px; border-bottom:1px solid #2a2e3b; }
+.sheet-wrap { overflow-x:auto; margin-top:12px; }
+table.sheet { min-width:1080px; margin-top:0; }
+table.sheet th { cursor:pointer; user-select:none; white-space:nowrap; }
+table.sheet th.num, table.sheet td.num { text-align:right; font-variant-numeric:tabular-nums; }
+table.sheet th.sorted-asc::after { content:" \\25B2"; color:#8eb4ff; }
+table.sheet th.sorted-desc::after { content:" \\25BC"; color:#8eb4ff; }
 .row-btn { margin:0; background:#5a3148; padding:4px 8px; font-size:12px; }
 h3 { margin-top:36px; }
 .flash { background:#1e3a2f; border:1px solid #2e8b57; padding:10px 12px; border-radius:6px; margin-bottom:16px; }
@@ -468,6 +474,36 @@ class WebConfig(commands.Cog):
                 }}
               }});
             }});
+            document.querySelectorAll("table.sheet th").forEach((th) => {{
+              if (th.dataset.nosort) return;
+              th.addEventListener("click", () => {{
+                const table = th.closest("table");
+                const headers = Array.from(table.querySelectorAll("thead th"));
+                const index = headers.indexOf(th);
+                const tbody = table.querySelector("tbody");
+                const rows = Array.from(tbody.querySelectorAll("tr"));
+                const asc = th.dataset.dir !== "asc";
+                headers.forEach((header) => {{
+                  header.dataset.dir = "";
+                  header.classList.remove("sorted-asc", "sorted-desc");
+                }});
+                th.dataset.dir = asc ? "asc" : "desc";
+                th.classList.add(asc ? "sorted-asc" : "sorted-desc");
+                rows.sort((a, b) => {{
+                  const left = a.children[index];
+                  const right = b.children[index];
+                  if (!left || !right) return 0;
+                  const av = left.dataset.sort ?? left.textContent.trim();
+                  const bv = right.dataset.sort ?? right.textContent.trim();
+                  const an = Number(av);
+                  const bn = Number(bv);
+                  const numeric = av !== "" && bv !== "" && !Number.isNaN(an) && !Number.isNaN(bn);
+                  const cmp = numeric ? an - bn : String(av).localeCompare(String(bv), undefined, {{numeric:true, sensitivity:"base"}});
+                  return asc ? cmp : -cmp;
+                }});
+                rows.forEach((row) => tbody.appendChild(row));
+              }});
+            }});
             let timer = null;
             document.querySelectorAll(".member-search").forEach((input) => {{
               input.addEventListener("input", () => {{
@@ -559,12 +595,28 @@ class WebConfig(commands.Cog):
             if action and not row_actions:
                 row_actions = [{"action": action, "label": "Remove"}]
             add_form = table.get("add_form")
-            head = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
+            sortable = bool(table.get("sortable"))
+            head_cells = []
+            for col in columns:
+                cls = "num" if sortable and col != "Member" else ""
+                head_cells.append(f'<th class="{cls}">{html.escape(col)}</th>')
+            head = "".join(head_cells)
             if row_actions:
-                head += "<th></th>"
+                head += '<th data-nosort="1"></th>'
             body_rows = []
             for row in rows:
-                cells = "".join(f"<td>{html.escape(str(row.get(col, '')))}</td>" for col in columns)
+                cells = []
+                for col in columns:
+                    value = row.get(col, "")
+                    if sortable and col != "Member":
+                        if value == "" or value is None:
+                            cells.append('<td class="num" data-sort="-1">—</td>')
+                        else:
+                            cells.append(
+                                f'<td class="num" data-sort="{html.escape(str(value))}">{html.escape(str(value))}</td>'
+                            )
+                    else:
+                        cells.append(f"<td>{html.escape(str(value))}</td>")
                 if row_actions:
                     rid = html.escape(str(row.get("id", "")))
                     name = html.escape(str(row.get("Item") or row.get("name") or ""))
@@ -587,13 +639,19 @@ class WebConfig(commands.Cog):
                             f'<button class="row-btn" type="submit">{html.escape(spec.get("label") or "Go")}</button>'
                             f"</form>"
                         )
-                    cells += f'<td>{" ".join(buttons)}</td>'
-                body_rows.append(f"<tr>{cells}</tr>")
+                    cells.append(f'<td>{" ".join(buttons)}</td>')
+                body_rows.append("<tr>" + "".join(cells) + "</tr>")
             body = "".join(body_rows) or f'<tr><td colspan="{len(columns)+1}">None</td></tr>'
             extra_form = ""
             if add_form:
                 extra_form = add_form.replace("__PLUGIN__", item["id"])
-            blocks.append(f"<h3>{title}</h3>{extra_form}<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+            note = html.escape(table.get("note") or "")
+            note_html = f'<p class="help">{note}</p>' if note else ""
+            table_class = "sheet" if sortable else ""
+            table_html = f'<table class="{table_class}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>'
+            if sortable:
+                table_html = f'<div class="sheet-wrap">{table_html}</div>'
+            blocks.append(f"<h3>{title}</h3>{note_html}{extra_form}{table_html}")
         return "".join(blocks)
 
     async def handle_action(self, request):
