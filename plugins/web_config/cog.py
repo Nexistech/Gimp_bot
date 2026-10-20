@@ -635,7 +635,7 @@ class WebConfig(commands.Cog):
             sortable = bool(table.get("sortable"))
             head_cells = []
             for col in columns:
-                cls = "num" if sortable and col != "Member" else ""
+                cls = "num" if sortable and col not in ("Member", "Drug") else ""
                 head_cells.append(f'<th class="{cls}">{html.escape(col)}</th>')
             head = "".join(head_cells)
             if row_actions:
@@ -645,7 +645,7 @@ class WebConfig(commands.Cog):
                 cells = []
                 for col in columns:
                     value = row.get(col, "")
-                    if sortable and col != "Member":
+                    if sortable and col not in ("Member", "Drug"):
                         if value == "" or value is None:
                             cells.append('<td class="num" data-sort="-1">—</td>')
                         else:

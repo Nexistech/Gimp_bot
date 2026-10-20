@@ -183,6 +183,27 @@ class OverdoseMonitor(commands.Cog):
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS od_drug_odds (
+                drug TEXT PRIMARY KEY,
+                uses INTEGER NOT NULL DEFAULT 0,
+                ods INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS od_user_odds (
+                user_id INTEGER NOT NULL,
+                drug TEXT NOT NULL,
+                name TEXT,
+                uses INTEGER NOT NULL DEFAULT 0,
+                ods INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, drug)
+            )
+            """
+        )
         cols = {row[1] for row in conn.execute("PRAGMA table_info(od_counts)").fetchall()}
         if "lifetime_fetched" not in cols:
             conn.execute("ALTER TABLE od_counts ADD COLUMN lifetime_fetched INTEGER NOT NULL DEFAULT 0")
@@ -315,6 +336,41 @@ class OverdoseMonitor(commands.Cog):
             return " or ".join(increases)
         return "a drug"
 
+    def note_drug_sample(self, conn, user_id, name, old_stats, new_stats, od_delta):
+        """Count a window only when one drug was used exactly once."""
+        if not old_stats or od_delta < 0 or od_delta > 1:
+            return
+        increases = []
+        for key, label in DRUG_FIELDS:
+            delta = int(new_stats.get(key) or 0) - int(old_stats.get(key) or 0)
+            if delta > 0:
+                increases.append((key, label, delta))
+        if len(increases) != 1 or increases[0][2] != 1:
+            return
+        key, label, _delta = increases[0]
+        if key == "opium" and od_delta:
+            return
+        ods = 1 if od_delta else 0
+        conn.execute(
+            """
+            INSERT INTO od_drug_odds (drug, uses, ods) VALUES (?, 1, ?)
+            ON CONFLICT(drug) DO UPDATE SET
+                uses = uses + 1,
+                ods = ods + excluded.ods
+            """,
+            (label, ods),
+        )
+        conn.execute(
+            """
+            INSERT INTO od_user_odds (user_id, drug, name, uses, ods) VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(user_id, drug) DO UPDATE SET
+                name = excluded.name,
+                uses = uses + 1,
+                ods = ods + excluded.ods
+            """,
+            (int(user_id), label, name, ods),
+        )
+
     async def fetch_drug_stats(self, session, user_id):
         url = (
             "https://api.torn.com/v2/user/"
@@ -440,12 +496,19 @@ class OverdoseMonitor(commands.Cog):
                     "UPDATE od_counts SET name = ?, api_total = ?, stats_json = ?, checked_at = ? WHERE user_id = ?",
                     (name, count, blob, pulled_at, user_id),
                 )
-                if count <= previous:
+                if count < previous:
                     conn.commit()
                     conn.close()
                     await asyncio.sleep(0.4)
                     continue
-                delta = count - previous
+                od_delta = count - previous
+                self.note_drug_sample(conn, user_id, name, old_stats, stats, od_delta)
+                if od_delta == 0:
+                    conn.commit()
+                    conn.close()
+                    await asyncio.sleep(0.4)
+                    continue
+                delta = od_delta
                 year = utc_now().year
                 if int(row["year"]) == year:
                     year_count = int(row["year_count"]) + delta
@@ -492,6 +555,13 @@ class OverdoseMonitor(commands.Cog):
             "SELECT user_id, name, year_count, total, lifetime_fetched, api_total, stats_json, checked_at FROM od_counts ORDER BY name"
         ).fetchall()
         comments = conn.execute("SELECT id, text FROM od_comments ORDER BY id").fetchall()
+        odds = {
+            row["drug"]: row
+            for row in conn.execute("SELECT drug, uses, ods FROM od_drug_odds")
+        }
+        user_odds = conn.execute(
+            "SELECT user_id, name, drug, uses, ods FROM od_user_odds WHERE uses > 0 ORDER BY name, drug"
+        ).fetchall()
         conn.close()
         count_rows = [
             {
@@ -545,6 +615,46 @@ class OverdoseMonitor(commands.Cog):
             else:
                 entry["Last pull"] = ""
             drug_rows.append(entry)
+        odds_rows = []
+        for _key, label in DRUG_FIELDS:
+            row = odds.get(label)
+            uses = int(row["uses"]) if row else 0
+            ods = int(row["ods"]) if row else 0
+            odds_rows.append(
+                {
+                    "Drug": label,
+                    "Uses": uses,
+                    "Overdoses": ods,
+                    "Chance %": "" if uses <= 0 else round(ods / uses * 100, 4),
+                }
+            )
+        member_totals = {}
+        member_drug_rows = []
+        for row in user_odds:
+            name = row["name"] or row["user_id"]
+            uses = int(row["uses"] or 0)
+            ods = int(row["ods"] or 0)
+            member_drug_rows.append(
+                {
+                    "Member": name,
+                    "Drug": row["drug"],
+                    "Uses": uses,
+                    "Overdoses": ods,
+                    "Chance %": "" if uses <= 0 else round(ods / uses * 100, 4),
+                }
+            )
+            bucket = member_totals.setdefault(name, {"uses": 0, "ods": 0})
+            bucket["uses"] += uses
+            bucket["ods"] += ods
+        member_rows = [
+            {
+                "Member": name,
+                "Uses": bucket["uses"],
+                "Overdoses": bucket["ods"],
+                "Chance %": "" if bucket["uses"] <= 0 else round(bucket["ods"] / bucket["uses"] * 100, 4),
+            }
+            for name, bucket in sorted(member_totals.items(), key=lambda item: item[0].lower())
+        ]
         comment_rows = [{"id": row["id"], "Comment": row["text"]} for row in comments]
         count_form = """
         <form method="post" action="/plugin/__PLUGIN__/action">
@@ -571,6 +681,27 @@ class OverdoseMonitor(commands.Cog):
                 "columns": drug_columns,
                 "rows": drug_rows,
                 "add_form": self.pull_form(),
+            },
+            {
+                "title": "Overdose chance",
+                "note": "Faction-wide, from windows where a member took exactly one dose of one drug. 1 overdose in 1,000 Xanax uses shows 0.1. History from before the bot was watching is not included.",
+                "sortable": True,
+                "columns": ["Drug", "Uses", "Overdoses", "Chance %"],
+                "rows": odds_rows,
+            },
+            {
+                "title": "Member overdose chance",
+                "note": "Same single-dose windows, totaled per member across every drug.",
+                "sortable": True,
+                "columns": ["Member", "Uses", "Overdoses", "Chance %"],
+                "rows": member_rows,
+            },
+            {
+                "title": "Member chance by drug",
+                "note": "Filter the Member or Drug column to narrow this down. Chance % is overdoses divided by uses.",
+                "sortable": True,
+                "columns": ["Member", "Drug", "Uses", "Overdoses", "Chance %"],
+                "rows": member_drug_rows,
             },
             {
                 "title": "Stored overdose counts",
