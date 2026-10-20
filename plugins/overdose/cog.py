@@ -1,4 +1,5 @@
 import datetime
+import asyncio
 import json
 import os
 import random
@@ -80,6 +81,21 @@ DEFAULT_COMMENTS = [
     "This one goes on the fridge. Face down.",
 ]
 
+DRUG_FIELDS = (
+    ("cannabis", "Cannabis"),
+    ("ecstasy", "Ecstasy"),
+    ("ketamine", "Ketamine"),
+    ("lsd", "LSD"),
+    ("opium", "Opium"),
+    ("pcp", "PCP"),
+    ("shrooms", "Shrooms"),
+    ("speed", "Speed"),
+    ("vicodin", "Vicodin"),
+    ("xanax", "Xanax"),
+)
+# Ketamine's minimum cooldown is 45 minutes, the shortest drug cooldown.
+# A full roster pass inside 30 minutes means only one drug can have been used.
+SWEEP_MINUTES = 30
 NEWS_RE = re.compile(
     r"(?P<name>.+?)\s*(?:\[(?P<tid>\d+)\])?\s+overdosed on\s+(?P<drug>[^.]+)",
     re.I,
@@ -167,6 +183,10 @@ class OverdoseMonitor(commands.Cog):
         cols = {row[1] for row in conn.execute("PRAGMA table_info(od_counts)").fetchall()}
         if "lifetime_fetched" not in cols:
             conn.execute("ALTER TABLE od_counts ADD COLUMN lifetime_fetched INTEGER NOT NULL DEFAULT 0")
+        if "api_total" not in cols:
+            conn.execute("ALTER TABLE od_counts ADD COLUMN api_total INTEGER")
+        if "stats_json" not in cols:
+            conn.execute("ALTER TABLE od_counts ADD COLUMN stats_json TEXT")
         existing = conn.execute("SELECT COUNT(*) FROM od_comments").fetchone()[0]
         if existing == 0:
             conn.executemany("INSERT INTO od_comments (text) VALUES (?)", [(c,) for c in DEFAULT_COMMENTS])
@@ -276,6 +296,34 @@ class OverdoseMonitor(commands.Cog):
         embed.set_footer(text=f"Torn ID {entry['user_id']}")
         await channel.send(embed=embed)
 
+    def drug_label(self, old_stats, new_stats):
+        increases = []
+        for key, label in DRUG_FIELDS:
+            if key == "opium":
+                continue
+            delta = int(new_stats.get(key) or 0) - int((old_stats or {}).get(key) or 0)
+            if delta > 0:
+                increases.append(label if delta == 1 else f"{label} x{delta}")
+        if len(increases) == 1:
+            return increases[0]
+        if increases:
+            return " or ".join(increases)
+        return "a drug"
+
+    async def fetch_drug_stats(self, session, user_id):
+        url = (
+            "https://api.torn.com/v2/user/"
+            f"{int(user_id)}/personalstats?cat=drugs&key={TORN_API_KEY}&comment=GimpBot"
+        )
+        async with session.get(url, timeout=20) as response:
+            data = await response.json(content_type=None)
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(data["error"])
+        drugs = (data.get("personalstats") or {}).get("drugs") or {}
+        if "overdoses" not in drugs:
+            raise RuntimeError("drugs.overdoses missing")
+        return drugs
+
     @tasks.loop(minutes=5)
     async def check_task(self):
         channel = self.enabled_channel()
@@ -288,37 +336,105 @@ class OverdoseMonitor(commands.Cog):
             except discord.HTTPException as exc:
                 log.warning(f"[Overdose] Channel {channel_id} is not available: {exc}")
                 return
-        try:
-            news = await self.fetch_news()
-        except Exception as exc:
-            log.error(f"[Overdose] Fetch failed: {exc}")
+        roster = self.bot.get_cog("FactionRoster")
+        if not roster or not roster.members_by_id:
             return
-        items = list(news)
-        conn = self.db()
-        seen_count = conn.execute("SELECT COUNT(*) FROM od_seen").fetchone()[0]
-        seed_only = seen_count == 0
-        recent_after = int(utc_now().timestamp()) - 15 * 60
-        for news_id, item in enumerate(items):
-            parsed = self.parse_news_item(news_id, item)
-            if not parsed:
-                continue
-            seen = conn.execute("SELECT 1 FROM od_seen WHERE news_id = ?", (parsed["news_id"],)).fetchone()
-            if seen:
-                continue
-            conn.execute(
-                "INSERT INTO od_seen (news_id, user_id, seen_at) VALUES (?, ?, ?)",
-                (parsed["news_id"], parsed["user_id"], utc_now().isoformat()),
-            )
-            conn.commit()
-            if seed_only and int(parsed["timestamp"] or 0) < recent_after:
-                continue
-            year_count, total = self.bump_counts(parsed["user_id"], parsed["name"])
+        members = []
+        for member in roster.all_members():
             try:
-                await self.post_od(channel, parsed, year_count, total)
-            except discord.HTTPException as exc:
-                log.error(f"[Overdose] Send failed: {exc}")
-        conn.close()
-
+                user_id = int(member.get("id") or member.get("user_id"))
+            except (TypeError, ValueError):
+                continue
+            members.append((user_id, member.get("name") or str(user_id)))
+        members.sort(key=lambda item: item[0])
+        if not members:
+            return
+        interval = max(1, int(self.settings.get("check_minutes") or 5))
+        batch = min(20, max(1, -(-len(members) * interval // SWEEP_MINUTES)))
+        sweep_minutes = len(members) / batch * interval
+        if sweep_minutes > 45:
+            log.warning(
+                f"[Overdose] Roster sweep is about {sweep_minutes:.0f} min, "
+                "longer than the 45 min ketamine cooldown."
+            )
+        start = getattr(self, "_cursor", 0) % len(members)
+        picked = [members[(start + offset) % len(members)] for offset in range(min(batch, len(members)))]
+        self._cursor = start + len(picked)
+        headers = {"User-Agent": "GimpBot/1.0"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            for user_id, name in picked:
+                try:
+                    stats = await self.fetch_drug_stats(session, user_id)
+                except Exception as exc:
+                    log.error(f"[Overdose] Stat lookup failed for {name} [{user_id}]: {exc}")
+                    await asyncio.sleep(0.4)
+                    continue
+                count = int(stats.get("overdoses") or 0)
+                conn = self.db()
+                row = conn.execute("SELECT * FROM od_counts WHERE user_id = ?", (user_id,)).fetchone()
+                previous = None if row is None or row["api_total"] is None else int(row["api_total"])
+                old_stats = None
+                if row and row["stats_json"]:
+                    try:
+                        old_stats = json.loads(row["stats_json"])
+                    except (TypeError, ValueError):
+                        old_stats = None
+                blob = json.dumps({key: int(stats.get(key) or 0) for key, _label in DRUG_FIELDS})
+                if previous is None or old_stats is None:
+                    year = utc_now().year
+                    year_count = int(row["year_count"]) if row else 0
+                    stored_total = count if row is None else int(row["total"] or count)
+                    conn.execute(
+                        """
+                        INSERT INTO od_counts
+                            (user_id, name, total, year, year_count, lifetime_fetched, api_total, stats_json)
+                        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            name=excluded.name,
+                            api_total=excluded.api_total,
+                            stats_json=excluded.stats_json,
+                            lifetime_fetched=1
+                        """,
+                        (user_id, name, stored_total, year, year_count, count, blob),
+                    )
+                    conn.commit()
+                    conn.close()
+                    await asyncio.sleep(0.4)
+                    continue
+                conn.execute(
+                    "UPDATE od_counts SET name = ?, api_total = ?, stats_json = ? WHERE user_id = ?",
+                    (name, count, blob, user_id),
+                )
+                if count <= previous:
+                    conn.commit()
+                    conn.close()
+                    await asyncio.sleep(0.4)
+                    continue
+                delta = count - previous
+                year = utc_now().year
+                if int(row["year"]) == year:
+                    year_count = int(row["year_count"]) + delta
+                else:
+                    year_count = delta
+                conn.execute(
+                    """
+                    UPDATE od_counts
+                    SET total = ?, year = ?, year_count = ?, lifetime_fetched = 1
+                    WHERE user_id = ?
+                    """,
+                    (count, year, year_count, user_id),
+                )
+                conn.commit()
+                conn.close()
+                drug = self.drug_label(old_stats, stats)
+                if delta > 1 and " or " not in drug and not drug.endswith("x" + str(delta)):
+                    drug = f"{drug} x{delta}" if drug != "a drug" else f"a drug x{delta}"
+                entry = {"user_id": user_id, "name": name, "drug": drug}
+                try:
+                    await self.post_od(channel, entry, year_count, count)
+                except discord.HTTPException as exc:
+                    log.error(f"[Overdose] Send failed: {exc}")
+                await asyncio.sleep(0.4)
     @check_task.before_loop
     async def before_check(self):
         await self.bot.wait_until_ready()
