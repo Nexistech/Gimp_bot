@@ -80,7 +80,12 @@ DEFAULT_COMMENTS = [
     "This one goes on the fridge. Face down.",
 ]
 
-NEWS_RE = re.compile(r"(?P<name>.+?)\s*(?:\[(?P<tid>\d+)\])?\s+overdosed on\s+(?P<drug>[^.]+)", re.I)
+NEWS_RE = re.compile(
+    r"(?P<name>.+?)\s*(?:\[(?P<tid>\d+)\])?\s+overdosed on\s+(?P<drug>[^.]+)",
+    re.I,
+)
+TAG_RE = re.compile(r"<[^>]+>")
+XID_RE = re.compile(r"XID=(\d+)", re.I)
 
 
 def utc_now():
@@ -205,34 +210,40 @@ class OverdoseMonitor(commands.Cog):
 
     async def fetch_news(self):
         if not TORN_API_KEY:
-            return {}
-        url = f"https://api.torn.com/faction/?selections=mainnews&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
+            return []
+        url = (
+            "https://api.torn.com/v2/faction/news?cat=main&striptags=false&limit=100"
+            f"&key={TORN_API_KEY}&comment=GimpBot"
+        )
+        headers = {"User-Agent": "GimpBot/1.0"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=20) as response:
                 response.raise_for_status()
-                data = await response.json()
-        if data.get("error"):
+                data = await response.json(content_type=None)
+        if isinstance(data, dict) and data.get("error"):
             log.error(f"[Overdose] API error: {data['error']}")
-            return {}
-        return data.get("mainnews") or data.get("news") or {}
+            return []
+        news = data.get("news") if isinstance(data, dict) else None
+        if isinstance(news, list):
+            return news
+        if isinstance(news, dict):
+            return [{"id": key, **value} if isinstance(value, dict) else {"id": key, "text": value} for key, value in news.items()]
+        return []
 
     def parse_news_item(self, news_id, item):
-        text = str(item.get("news") or item.get("text") or item)
-        match = NEWS_RE.search(text)
+        if not isinstance(item, dict):
+            return None
+        raw = str(item.get("news") or item.get("text") or "")
+        plain = " ".join(TAG_RE.sub(" ", raw).split())
+        match = NEWS_RE.search(plain)
         if not match:
-            if "overdos" not in text.lower():
-                return None
-            tid = None
-            name = "Unknown"
-        else:
-            name = match.group("name").strip()
-            tid = match.group("tid")
-            drug = match.group("drug").strip()
-        if match:
-            drug = match.group("drug").strip()
-        else:
-            drug = "a drug"
+            if "overdos" in plain.lower():
+                log.warning(f"[Overdose] Could not parse: {plain[:180]}")
+            return None
+        name = match.group("name").strip(" -")
+        drug = match.group("drug").strip()
+        xid = XID_RE.search(raw)
+        tid = match.group("tid") or (xid.group(1) if xid else None)
         if not tid:
             roster = self.bot.get_cog("FactionRoster")
             member = roster.get_member_by_name(name) if roster else None
@@ -240,19 +251,17 @@ class OverdoseMonitor(commands.Cog):
                 tid = member.get("id") or member.get("user_id")
                 name = member.get("name") or name
         if not tid:
+            log.warning(f"[Overdose] No Torn ID for {plain[:180]}")
             return None
         return {
-            "news_id": str(news_id),
+            "news_id": str(item.get("id") or news_id),
             "user_id": int(tid),
             "name": name,
             "drug": drug,
-            "timestamp": item.get("timestamp") if isinstance(item, dict) else None,
+            "timestamp": int(item.get("timestamp") or 0),
         }
 
-    async def post_od(self, entry, year_count, total):
-        channel = self.enabled_channel()
-        if not channel:
-            return
+    async def post_od(self, channel, entry, year_count, total):
         profile = f"https://www.torn.com/profiles.php?XID={entry['user_id']}"
         year = utc_now().year
         desc = (
@@ -269,20 +278,27 @@ class OverdoseMonitor(commands.Cog):
 
     @tasks.loop(minutes=5)
     async def check_task(self):
-        if not self.enabled_channel():
-            return
+        channel = self.enabled_channel()
+        if channel is None:
+            channel_id = int(self.settings.get("channel_id") or 0)
+            if not channel_id:
+                return
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except discord.HTTPException as exc:
+                log.warning(f"[Overdose] Channel {channel_id} is not available: {exc}")
+                return
         try:
             news = await self.fetch_news()
         except Exception as exc:
             log.error(f"[Overdose] Fetch failed: {exc}")
             return
-        items = list(news.items()) if isinstance(news, dict) else list(enumerate(news))
+        items = list(news)
         conn = self.db()
         seen_count = conn.execute("SELECT COUNT(*) FROM od_seen").fetchone()[0]
         seed_only = seen_count == 0
-        for news_id, item in items:
-            if not isinstance(item, dict):
-                continue
+        recent_after = int(utc_now().timestamp()) - 15 * 60
+        for news_id, item in enumerate(items):
             parsed = self.parse_news_item(news_id, item)
             if not parsed:
                 continue
@@ -294,11 +310,11 @@ class OverdoseMonitor(commands.Cog):
                 (parsed["news_id"], parsed["user_id"], utc_now().isoformat()),
             )
             conn.commit()
-            if seed_only:
+            if seed_only and int(parsed["timestamp"] or 0) < recent_after:
                 continue
             year_count, total = self.bump_counts(parsed["user_id"], parsed["name"])
             try:
-                await self.post_od(parsed, year_count, total)
+                await self.post_od(channel, parsed, year_count, total)
             except discord.HTTPException as exc:
                 log.error(f"[Overdose] Send failed: {exc}")
         conn.close()
