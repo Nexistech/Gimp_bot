@@ -135,6 +135,7 @@ class OverdoseMonitor(commands.Cog):
         self.bot = bot
         self.settings = load_settings(PLUGIN_DIR, schema_defaults(self.SETTINGS_SCHEMA))
         self.initialize_db()
+        self._pulling = False
         self.check_task.start()
 
     def reload_settings(self, data=None):
@@ -326,20 +327,27 @@ class OverdoseMonitor(commands.Cog):
             raise RuntimeError("drugs.overdoses missing")
         return drugs
 
-    @tasks.loop(minutes=5)
-    async def check_task(self):
+    async def pull_stats(self, force=False):
+        if self._pulling:
+            return
+        self._pulling = True
+        try:
+            await self._run_pull(force)
+        finally:
+            self._pulling = False
+
+    async def _run_pull(self, force=False):
         channel = self.enabled_channel()
         if channel is None:
             channel_id = int(self.settings.get("channel_id") or 0)
-            if not channel_id:
-                return
-            try:
-                channel = await self.bot.fetch_channel(channel_id)
-            except discord.HTTPException as exc:
-                log.warning(f"[Overdose] Channel {channel_id} is not available: {exc}")
-                return
+            if channel_id:
+                try:
+                    channel = await self.bot.fetch_channel(channel_id)
+                except discord.HTTPException as exc:
+                    log.warning(f"[Overdose] Channel {channel_id} is not available: {exc}")
         roster = self.bot.get_cog("FactionRoster")
         if not roster or not roster.members_by_id:
+            log.warning("[Overdose] Roster is empty, so no drug stats were pulled.")
             return
         members = []
         for member in roster.all_members():
@@ -364,10 +372,13 @@ class OverdoseMonitor(commands.Cog):
         due = []
         for user_id, name in members:
             checked_at = known.get(user_id)
-            if checked_at is None or int(checked_at) <= due_before:
+            if force or checked_at is None or int(checked_at) <= due_before:
                 due.append((int(checked_at or 0), user_id, name))
         due.sort()
-        picked = [(user_id, name) for _checked, user_id, name in due[:batch]]
+        if force:
+            picked = [(user_id, name) for _checked, user_id, name in due]
+        else:
+            picked = [(user_id, name) for _checked, user_id, name in due[:batch]]
         if not picked:
             return
         sweep_minutes = len(members) / batch * interval
@@ -449,14 +460,25 @@ class OverdoseMonitor(commands.Cog):
                 if delta > 1 and " or " not in drug and not drug.endswith("x" + str(delta)):
                     drug = f"{drug} x{delta}" if drug != "a drug" else f"a drug x{delta}"
                 entry = {"user_id": user_id, "name": name, "drug": drug}
-                try:
-                    await self.post_od(channel, entry, year_count, count)
-                except discord.HTTPException as exc:
-                    log.error(f"[Overdose] Send failed: {exc}")
+                if channel is None:
+                    log.warning(f"[Overdose] {name} overdosed on {drug}, but no channel is configured.")
+                else:
+                    try:
+                        await self.post_od(channel, entry, year_count, count)
+                    except discord.HTTPException as exc:
+                        log.error(f"[Overdose] Send failed: {exc}")
                 await asyncio.sleep(0.4)
+
+    @tasks.loop(minutes=5)
+    async def check_task(self):
+        await self.pull_stats(force=False)
+
     @check_task.before_loop
     async def before_check(self):
         await self.bot.wait_until_ready()
+        roster = self.bot.get_cog("FactionRoster")
+        if roster:
+            await roster.wait_until_populated()
 
     def web_tables(self):
         conn = self.db()
@@ -475,15 +497,32 @@ class OverdoseMonitor(commands.Cog):
             }
             for row in counts
         ]
+        stored = {int(row["user_id"]): row for row in counts}
+        roster = self.bot.get_cog("FactionRoster")
+        people = []
+        if roster:
+            for member in roster.all_members():
+                try:
+                    user_id = int(member.get("id") or member.get("user_id"))
+                except (TypeError, ValueError):
+                    continue
+                people.append((user_id, member.get("name") or str(user_id)))
+        if not people:
+            people = [(int(row["user_id"]), row["name"] or row["user_id"]) for row in counts]
+        people.sort(key=lambda item: str(item[1]).lower())
         drug_columns = ["Member", "Overdoses"] + [label for _key, label in DRUG_FIELDS] + ["Total taken", "Last pull"]
         drug_rows = []
-        for row in counts:
+        for user_id, name in people:
+            row = stored.get(user_id)
             try:
-                stats = json.loads(row["stats_json"]) if row["stats_json"] else None
+                stats = json.loads(row["stats_json"]) if row and row["stats_json"] else None
             except (TypeError, ValueError):
                 stats = None
-            entry = {"Member": row["name"] or row["user_id"]}
-            entry["Overdoses"] = "" if row["api_total"] is None else int(row["api_total"])
+            entry = {"Member": name}
+            if row is None or row["api_total"] is None:
+                entry["Overdoses"] = ""
+            else:
+                entry["Overdoses"] = int(row["api_total"])
             taken = 0
             for key, label in DRUG_FIELDS:
                 if not stats:
@@ -492,9 +531,10 @@ class OverdoseMonitor(commands.Cog):
                     entry[label] = int(stats.get(key) or 0)
                     taken += entry[label]
             entry["Total taken"] = "" if not stats else taken
-            if row["checked_at"]:
+            checked_at = row["checked_at"] if row else None
+            if checked_at:
                 entry["Last pull"] = datetime.datetime.fromtimestamp(
-                    int(row["checked_at"]), datetime.timezone.utc
+                    int(checked_at), datetime.timezone.utc
                 ).strftime("%Y-%m-%d %H:%M")
             else:
                 entry["Last pull"] = ""
@@ -520,10 +560,11 @@ class OverdoseMonitor(commands.Cog):
         return [
             {
                 "title": "Drug use",
-                "note": "Click a column heading to sort. Counts appear as the roster scan stores them.",
+                "note": "Everyone in the roster is listed. A dash means that member has not been pulled yet. Last pull is UTC. Click a heading to sort.",
                 "sortable": True,
                 "columns": drug_columns,
                 "rows": drug_rows,
+                "add_form": self.pull_form(),
             },
             {
                 "title": "Stored overdose counts",
@@ -547,6 +588,34 @@ class OverdoseMonitor(commands.Cog):
                 "add_form": comment_form,
             },
         ]
+
+    def pull_form(self):
+        nxt = getattr(self.check_task, "next_iteration", None)
+        next_ts = int(nxt.timestamp()) if nxt else 0
+        return f"""
+        <p class="help">Next automatic pull <strong id="od-countdown" data-next="{next_ts}">...</strong></p>
+        <form method="post" action="/plugin/__PLUGIN__/action">
+          <input type="hidden" name="action" value="pull_now">
+          <button type="submit">Pull now</button>
+        </form>
+        <script>
+        (function () {{
+          const el = document.getElementById("od-countdown");
+          if (!el) return;
+          const next = Number(el.dataset.next || 0);
+          function tick() {{
+            if (!next) {{ el.textContent = "is not scheduled yet"; return; }}
+            const sec = Math.max(0, next - Math.floor(Date.now() / 1000));
+            if (sec <= 0) {{ el.textContent = "is due now"; return; }}
+            const m = Math.floor(sec / 60);
+            const s = String(sec % 60).padStart(2, "0");
+            el.textContent = "in " + m + "m " + s + "s";
+          }}
+          tick();
+          setInterval(tick, 1000);
+        }})();
+        </script>
+        """
 
     def fetch_lifetime(self, user_id):
         if not TORN_API_KEY:
@@ -576,6 +645,11 @@ class OverdoseMonitor(commands.Cog):
 
     def web_action(self, data):
         action = data.get("action")
+        if action == "pull_now":
+            if self._pulling:
+                return "A pull is already running."
+            asyncio.get_running_loop().create_task(self.pull_stats(force=True))
+            return "Pull started for the whole roster. Refresh in a minute to see Last pull fill in."
         conn = self.db()
         if action == "fetch_lifetimes":
             conn.close()
