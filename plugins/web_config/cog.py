@@ -293,7 +293,7 @@ class WebConfig(commands.Cog):
 
     def search_channels(self, query, limit=12):
         guild = self.config_guild()
-        results = [{"id": 0, "name": "Disabled"}]
+        results = [{"id": "0", "name": "Disabled"}]
         if not guild:
             return results[:limit]
         query = (query or "").strip().lower()
@@ -305,8 +305,19 @@ class WebConfig(commands.Cog):
                 if query in ch.name.lower() or query == str(ch.id) or query in {"off", "disable", "disabled"}
             ]
         channels = sorted(channels, key=lambda c: (c.position, c.name.lower()))[: limit - 1]
-        results.extend({"id": ch.id, "name": f"#{ch.name}"} for ch in channels)
+        results.extend({"id": str(ch.id), "name": f"#{ch.name}"} for ch in channels)
         return results
+
+    def channel_label(self, channel_id):
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            for guild in list(self.bot.guilds):
+                channel = guild.get_channel(channel_id) or guild.get_thread(channel_id)
+                if channel is not None:
+                    break
+        if channel is None:
+            return str(channel_id)
+        return f"#{channel.name} ({channel_id})"
 
     def discord_channel_html(self, key, label, value, help_html):
         try:
@@ -314,8 +325,7 @@ class WebConfig(commands.Cog):
         except (TypeError, ValueError):
             channel_id = 0
         if channel_id:
-            channel = self.bot.get_channel(channel_id)
-            shown = f"#{channel.name}" if channel else str(channel_id)
+            shown = self.channel_label(channel_id)
         else:
             shown = "Disabled"
         chip = (
