@@ -147,6 +147,7 @@ class OverdoseMonitor(commands.Cog):
         self._pulling = False
         self._pull_done = 0
         self._pull_total = 0
+        self._force_queued = False
         self.check_task.start()
 
     def reload_settings(self, data=None):
@@ -156,6 +157,22 @@ class OverdoseMonitor(commands.Cog):
 
     def cog_unload(self):
         self.check_task.cancel()
+
+    def mark_checked(self, user_id, name):
+        now = int(utc_now().timestamp())
+        conn = self.db()
+        conn.execute(
+            """
+            INSERT INTO od_counts (user_id, name, total, year, year_count, checked_at)
+            VALUES (?, ?, 0, ?, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                name = excluded.name,
+                checked_at = excluded.checked_at
+            """,
+            (int(user_id), name, utc_now().year, now),
+        )
+        conn.commit()
+        conn.close()
 
     def db(self):
         conn = sqlite3.connect(DB_NAME)
@@ -493,10 +510,18 @@ class OverdoseMonitor(commands.Cog):
 
     async def pull_stats(self, force=False):
         if self._pulling:
+            if force:
+                self._force_queued = True
             return
         self._pulling = True
         try:
-            await self._run_pull(force)
+            run_force = force
+            while True:
+                self._force_queued = False
+                await self._run_pull(run_force)
+                if not self._force_queued:
+                    break
+                run_force = True
         finally:
             self._pulling = False
 
@@ -519,7 +544,7 @@ class OverdoseMonitor(commands.Cog):
         if not members:
             return
         interval = max(1, int(self.settings.get("check_minutes") or 5))
-        batch = min(20, max(1, -(-len(members) * interval // SWEEP_MINUTES)))
+        batch = max(1, -(-len(members) * interval // SWEEP_MINUTES))
         now_ts = int(utc_now().timestamp())
         due_before = now_ts - (SWEEP_MINUTES * 60)
         conn = self.db()
@@ -535,7 +560,7 @@ class OverdoseMonitor(commands.Cog):
                 due.append((int(checked_at or 0), user_id, name))
         due.sort()
         if force:
-            picked = [(user_id, name) for _checked, user_id, name in due]
+            picked = list(members)
         else:
             picked = [(user_id, name) for _checked, user_id, name in due[:batch]]
         if not picked:
@@ -557,6 +582,7 @@ class OverdoseMonitor(commands.Cog):
                     stats = await self.fetch_drug_stats(session, user_id)
                 except Exception as exc:
                     log.error(f"[Overdose] Stat lookup failed for {name} [{user_id}]: {exc}")
+                    self.mark_checked(user_id, name)
                     await asyncio.sleep(0.4)
                     continue
                 count = int(stats.get("overdoses") or 0)
@@ -946,8 +972,10 @@ class OverdoseMonitor(commands.Cog):
     def web_action(self, data):
         action = data.get("action")
         if action == "pull_now":
-            if self._pulling:
-                return "A pull is already running."
+            if self._pulling or self._force_queued:
+                self._force_queued = True
+                return "A pull is already running. The full roster will be pulled when it finishes."
+            self._force_queued = False
             asyncio.get_running_loop().create_task(self.pull_stats(force=True))
             return "Pull started for the whole roster. Refresh in a minute to see Last pull fill in."
         conn = self.db()
