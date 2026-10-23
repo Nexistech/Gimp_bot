@@ -12,6 +12,7 @@ import urllib.request
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 sys.path.append(os.getcwd())
@@ -129,6 +130,14 @@ class OverdoseMonitor(commands.Cog):
             "label": "Append a random snarky comment",
             "default": True,
         },
+        {
+            "key": "watch_ids",
+            "type": "int_list",
+            "label": "Call out these members when they take a drug",
+            "default": [],
+            "widget": "torn_ids",
+            "help": "Overdoses are still posted for everyone. A drug use is posted only for members on this list.",
+        },
     ]
 
     def __init__(self, bot):
@@ -219,7 +228,32 @@ class OverdoseMonitor(commands.Cog):
         conn.commit()
         conn.close()
 
-    def enabled_channel(self):
+    def watched(self, user_id):
+        ids = set()
+        for raw in self.settings.get("watch_ids") or []:
+            try:
+                ids.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return int(user_id) in ids
+
+    def dose_changes(self, old_stats, new_stats):
+        if not old_stats:
+            return []
+        changes = []
+        for key, label in DRUG_FIELDS:
+            delta = int(new_stats.get(key) or 0) - int(old_stats.get(key) or 0)
+            if delta > 0:
+                changes.append((label, delta))
+        return changes
+
+    def format_doses(self, changes):
+        parts = [label if delta == 1 else f"{label} x{delta}" for label, delta in changes]
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        return ", ".join(parts[:-1]) + " and " + parts[-1]
         channel_id = int(self.settings.get("channel_id") or 0)
         if not channel_id:
             return None
@@ -336,6 +370,33 @@ class OverdoseMonitor(commands.Cog):
             return " or ".join(increases)
         return "a drug"
 
+    def watched(self, user_id):
+        ids = set()
+        for raw in self.settings.get("watch_ids") or []:
+            try:
+                ids.add(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return int(user_id) in ids
+
+    def dose_changes(self, old_stats, new_stats):
+        if not old_stats:
+            return []
+        changes = []
+        for key, label in DRUG_FIELDS:
+            delta = int(new_stats.get(key) or 0) - int(old_stats.get(key) or 0)
+            if delta > 0:
+                changes.append((label, delta))
+        return changes
+
+    def format_doses(self, changes):
+        parts = [label if delta == 1 else f"{label} x{delta}" for label, delta in changes]
+        if len(parts) == 1:
+            return parts[0]
+        if not parts:
+            return ""
+        return ", ".join(parts[:-1]) + " and " + parts[-1]
+
     def note_drug_sample(self, conn, user_id, name, old_stats, new_stats, od_delta):
         """Count a window only when one drug was used exactly once."""
         if not old_stats or od_delta < 0 or od_delta > 1:
@@ -346,10 +407,10 @@ class OverdoseMonitor(commands.Cog):
             if delta > 0:
                 increases.append((key, label, delta))
         if len(increases) != 1 or increases[0][2] != 1:
-            return
+            return None
         key, label, _delta = increases[0]
         if key == "opium" and od_delta:
-            return
+            return None
         ods = 1 if od_delta else 0
         conn.execute(
             """
@@ -370,6 +431,51 @@ class OverdoseMonitor(commands.Cog):
             """,
             (int(user_id), label, name, ods),
         )
+        return label
+
+    async def notification_channel(self):
+        channel_id = int(self.settings.get("channel_id") or 0)
+        if not channel_id:
+            return None
+        channel = self.bot.get_channel(channel_id)
+        if channel is not None:
+            return channel
+        try:
+            return await self.bot.fetch_channel(channel_id)
+        except discord.HTTPException as exc:
+            log.warning(f"[Overdose] Channel {channel_id} is not available: {exc}")
+            return None
+
+    async def post_use(self, channel, user_id, name, drug):
+        profile = f"https://www.torn.com/profiles.php?XID={user_id}"
+        await channel.send(f"**[{name}]({profile})** took **{drug}**.")
+
+    async def deliver_use(self, channel, user_id, name, drug):
+        channel = channel or await self.notification_channel()
+        if channel is None:
+            log.warning(f"[Overdose] {name} took {drug}, but no channel is configured.")
+            return None
+        try:
+            await self.post_use(channel, user_id, name, drug)
+        except Exception as exc:
+            log.error(f"[Overdose] Use post failed for {name}: {exc}")
+        return channel
+
+    async def deliver_od(self, channel, user_id, name, drug, year_count, total):
+        channel = channel or await self.notification_channel()
+        if channel is None:
+            log.warning(f"[Overdose] {name} overdosed on {drug}, but no channel is configured.")
+            return None
+        try:
+            await self.post_od(
+                channel,
+                {"user_id": user_id, "name": name, "drug": drug},
+                year_count,
+                total,
+            )
+        except Exception as exc:
+            log.error(f"[Overdose] Overdose post failed for {name}: {exc}")
+        return channel
 
     async def fetch_drug_stats(self, session, user_id):
         url = (
@@ -395,14 +501,9 @@ class OverdoseMonitor(commands.Cog):
             self._pulling = False
 
     async def _run_pull(self, force=False):
-        channel = self.enabled_channel()
+        channel = await self.notification_channel()
         if channel is None:
-            channel_id = int(self.settings.get("channel_id") or 0)
-            if channel_id:
-                try:
-                    channel = await self.bot.fetch_channel(channel_id)
-                except discord.HTTPException as exc:
-                    log.warning(f"[Overdose] Channel {channel_id} is not available: {exc}")
+            log.warning("[Overdose] No notification channel is set, so pulls will be saved but not posted.")
         roster = self.bot.get_cog("FactionRoster")
         if not roster or not roster.members_by_id:
             log.warning("[Overdose] Roster is empty, so no drug stats were pulled.")
@@ -490,6 +591,16 @@ class OverdoseMonitor(commands.Cog):
                     )
                     conn.commit()
                     conn.close()
+                    gained = 0 if previous is None else max(0, count - previous)
+                    if gained:
+                        channel = await self.deliver_od(
+                            channel,
+                            user_id,
+                            name,
+                            "a drug" if gained == 1 else f"a drug x{gained}",
+                            gained,
+                            count,
+                        )
                     await asyncio.sleep(0.4)
                     continue
                 conn.execute(
@@ -502,10 +613,13 @@ class OverdoseMonitor(commands.Cog):
                     await asyncio.sleep(0.4)
                     continue
                 od_delta = count - previous
-                self.note_drug_sample(conn, user_id, name, old_stats, stats, od_delta)
+                used = self.note_drug_sample(conn, user_id, name, old_stats, stats, od_delta)
                 if od_delta == 0:
                     conn.commit()
                     conn.close()
+                    doses = self.format_doses(self.dose_changes(old_stats, stats))
+                    if doses and self.watched(user_id):
+                        channel = await self.deliver_use(channel, user_id, name, doses)
                     await asyncio.sleep(0.4)
                     continue
                 delta = od_delta
@@ -527,14 +641,8 @@ class OverdoseMonitor(commands.Cog):
                 drug = self.drug_label(old_stats, stats)
                 if delta > 1 and " or " not in drug and not drug.endswith("x" + str(delta)):
                     drug = f"{drug} x{delta}" if drug != "a drug" else f"a drug x{delta}"
-                entry = {"user_id": user_id, "name": name, "drug": drug}
-                if channel is None:
-                    log.warning(f"[Overdose] {name} overdosed on {drug}, but no channel is configured.")
-                else:
-                    try:
-                        await self.post_od(channel, entry, year_count, count)
-                    except discord.HTTPException as exc:
-                        log.error(f"[Overdose] Send failed: {exc}")
+                entry_drug = drug
+                channel = await self.deliver_od(channel, user_id, name, entry_drug, year_count, count)
                 await asyncio.sleep(0.4)
                 self._pull_done = index
 
@@ -923,6 +1031,86 @@ class OverdoseMonitor(commands.Cog):
             return f"Added {len(lines)} comment(s)."
         conn.close()
         return "Unknown action."
+
+    def find_member(self, query):
+        roster = self.bot.get_cog("FactionRoster")
+        if not roster:
+            return None
+        query = str(query or "").strip()
+        if not query:
+            return None
+        partial = None
+        for member in roster.all_members():
+            name = str(member.get("name") or "")
+            user_id = str(member.get("id") or member.get("user_id") or "")
+            if query.lower() == name.lower() or query == user_id:
+                return member
+            if partial is None and query.lower() in name.lower():
+                partial = member
+        return partial
+
+    def drug_embed(self, member):
+        user_id = int(member.get("id") or member.get("user_id"))
+        name = member.get("name") or str(user_id)
+        conn = self.db()
+        row = conn.execute(
+            "SELECT api_total, total, year_count, stats_json FROM od_counts WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        conn.close()
+        profile = f"https://www.torn.com/profiles.php?XID={user_id}"
+        if row is None or not row["stats_json"]:
+            return discord.Embed(
+                description=f"**[{name}]({profile})** has not been pulled yet.",
+                color=discord.Color.purple(),
+            )
+        try:
+            stats = json.loads(row["stats_json"])
+        except (TypeError, ValueError):
+            stats = {}
+        total = row["api_total"] if row["api_total"] is not None else row["total"]
+        lines = [
+            f"**[{name}]({profile})**",
+            f"Overdoses: **{int(total or 0):,}** all time, **{int(row['year_count'] or 0):,}** this year",
+            "",
+        ]
+        taken = 0
+        for key, label in DRUG_FIELDS:
+            amount = int((stats or {}).get(key) or 0)
+            taken += amount
+            lines.append(f"{label}: **{amount:,}**")
+        lines.append(f"\nTotal doses: **{taken:,}**")
+        return discord.Embed(description="\n".join(lines), color=discord.Color.purple())
+
+    @app_commands.command(name="drugs", description="Show a member's drug counts and overdoses.")
+    @app_commands.describe(
+        name="Faction member name or Torn ID",
+        public="Post in this channel instead of only to you",
+    )
+    async def drugs_command(self, interaction: discord.Interaction, name: str, public: bool = False):
+        await interaction.response.defer(ephemeral=not public)
+        member = self.find_member(name)
+        if not member:
+            await interaction.followup.send("No faction member matches that name.", ephemeral=not public)
+            return
+        await interaction.followup.send(embed=self.drug_embed(member), ephemeral=not public)
+
+    @drugs_command.autocomplete("name")
+    async def drugs_name(self, interaction: discord.Interaction, current: str):
+        roster = self.bot.get_cog("FactionRoster")
+        if not roster:
+            return []
+        current = (current or "").lower()
+        choices = []
+        for member in roster.all_members():
+            member_name = str(member.get("name") or "")
+            user_id = str(member.get("id") or member.get("user_id") or "")
+            if current and current not in member_name.lower() and current not in user_id:
+                continue
+            choices.append(app_commands.Choice(name=member_name[:100], value=member_name[:100]))
+            if len(choices) >= 25:
+                break
+        return choices
 
 
 async def setup(bot: commands.Bot):
