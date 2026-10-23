@@ -97,6 +97,7 @@ DRUG_FIELDS = (
 # Ketamine's minimum cooldown is 45 minutes, the shortest drug cooldown.
 # A full roster pass inside 30 minutes means only one drug can have been used.
 SWEEP_MINUTES = 30
+BATCH_PAUSE_SECONDS = 90
 NEWS_RE = re.compile(
     r"(?P<name>.+?)\s*(?:\[(?P<tid>\d+)\])?\s+overdosed on\s+(?P<drug>[^.]+)",
     re.I,
@@ -584,6 +585,12 @@ class OverdoseMonitor(commands.Cog):
                     log.error(f"[Overdose] Stat lookup failed for {name} [{user_id}]: {exc}")
                     self.mark_checked(user_id, name)
                     await asyncio.sleep(0.4)
+                    if index % batch == 0 and index < len(picked):
+                        log.info(
+                            f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
+                            "so the shared API limit can recover."
+                        )
+                        await asyncio.sleep(BATCH_PAUSE_SECONDS)
                     continue
                 count = int(stats.get("overdoses") or 0)
                 conn = self.db()
@@ -628,6 +635,12 @@ class OverdoseMonitor(commands.Cog):
                             count,
                         )
                     await asyncio.sleep(0.4)
+                    if index % batch == 0 and index < len(picked):
+                        log.info(
+                            f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
+                            "so the shared API limit can recover."
+                        )
+                        await asyncio.sleep(BATCH_PAUSE_SECONDS)
                     continue
                 conn.execute(
                     "UPDATE od_counts SET name = ?, api_total = ?, stats_json = ?, checked_at = ? WHERE user_id = ?",
@@ -637,6 +650,12 @@ class OverdoseMonitor(commands.Cog):
                     conn.commit()
                     conn.close()
                     await asyncio.sleep(0.4)
+                    if index % batch == 0 and index < len(picked):
+                        log.info(
+                            f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
+                            "so the shared API limit can recover."
+                        )
+                        await asyncio.sleep(BATCH_PAUSE_SECONDS)
                     continue
                 od_delta = count - previous
                 used = self.note_drug_sample(conn, user_id, name, old_stats, stats, od_delta)
@@ -647,6 +666,12 @@ class OverdoseMonitor(commands.Cog):
                     if doses and self.watched(user_id):
                         channel = await self.deliver_use(channel, user_id, name, doses)
                     await asyncio.sleep(0.4)
+                    if index % batch == 0 and index < len(picked):
+                        log.info(
+                            f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
+                            "so the shared API limit can recover."
+                        )
+                        await asyncio.sleep(BATCH_PAUSE_SECONDS)
                     continue
                 delta = od_delta
                 year = utc_now().year
@@ -670,6 +695,12 @@ class OverdoseMonitor(commands.Cog):
                 entry_drug = drug
                 channel = await self.deliver_od(channel, user_id, name, entry_drug, year_count, count)
                 await asyncio.sleep(0.4)
+                if index % batch == 0 and index < len(picked):
+                    log.info(
+                        f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
+                        "so the shared API limit can recover."
+                    )
+                    await asyncio.sleep(BATCH_PAUSE_SECONDS)
                 self._pull_done = index
 
     @tasks.loop(minutes=5)
