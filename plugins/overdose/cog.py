@@ -960,8 +960,11 @@ class OverdoseMonitor(commands.Cog):
             if wait <= 0:
                 break
             time.sleep(min(wait, 1))
-        with urllib.request.urlopen(req, timeout=20) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        finally:
+            scheduler.note_call("overdose")
         if data.get("error"):
             raise RuntimeError(data["error"])
         stats = data.get("personalstats") or {}

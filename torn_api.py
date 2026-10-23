@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -43,16 +44,28 @@ class TornScheduler:
         self.order = list(DEFAULT_ORDER)
         self._times = deque()
         self._time_lock = threading.Lock()
-        self._slot_lock = asyncio.Lock()
+        self._db_lock = threading.Lock()
+        self._db_path = None
+        self._history_hours = 48
+        self._retain_hours = 48
+        self._pending_notes = []
+        self._notes = 0
         self._pending = []
         self._pending_lock = asyncio.Lock()
         self._seq = 0
         self._wake = None
         self._worker = None
+        self._sampler = None
         self._session = None
 
-    def configure(self, calls_per_minute, order):
+    def configure(self, calls_per_minute, order, history_hours=48, db_path=None):
         self.calls_per_minute = max(1, int(calls_per_minute or 80))
+        try:
+            hours = int(history_hours or 48)
+        except (TypeError, ValueError):
+            hours = 48
+        self._history_hours = max(1, min(336, hours))
+        self._retain_hours = max(48, self._history_hours)
         cleaned = []
         for cog_id in order or []:
             cog_id = str(cog_id)
@@ -62,6 +75,13 @@ class TornScheduler:
             if cog_id not in cleaned:
                 cleaned.append(cog_id)
         self.order = cleaned
+        if db_path:
+            self._db_path = db_path
+            self._init_db()
+            if self._pending_notes:
+                self._insert_calls(self._pending_notes)
+                self._pending_notes = []
+            self._prune()
 
     def rank(self, cog_id):
         try:
@@ -77,6 +97,116 @@ class TornScheduler:
             "limit": self.calls_per_minute,
             "used": used,
             "waiting": len(self._pending),
+        }
+
+    def _init_db(self):
+        with self._db_lock:
+            conn = sqlite3.connect(self._db_path, timeout=5)
+            conn.execute("CREATE TABLE IF NOT EXISTS calls (ts INTEGER NOT NULL, cog TEXT NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS calls_ts ON calls (ts)")
+            conn.execute("CREATE TABLE IF NOT EXISTS queue_depth (minute INTEGER PRIMARY KEY, depth INTEGER NOT NULL)")
+            conn.commit()
+            conn.close()
+
+    def _prune(self):
+        if not self._db_path:
+            return
+        cutoff = int(time.time()) - self._retain_hours * 3600
+        with self._db_lock:
+            conn = sqlite3.connect(self._db_path, timeout=5)
+            conn.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
+            conn.execute("DELETE FROM queue_depth WHERE minute < ?", (cutoff,))
+            conn.commit()
+            conn.close()
+
+    def note_call(self, cog):
+        row = (int(time.time()), str(cog or "unknown"))
+        if not self._db_path:
+            self._pending_notes.append(row)
+            return
+        self._insert_calls([row])
+        self._notes += 1
+        if self._notes % 50 == 0:
+            self._prune()
+
+    def _insert_calls(self, rows):
+        with self._db_lock:
+            conn = sqlite3.connect(self._db_path, timeout=5)
+            conn.executemany("INSERT INTO calls (ts, cog) VALUES (?, ?)", rows)
+            conn.commit()
+            conn.close()
+
+    def _record_queue(self):
+        if not self._db_path:
+            return
+        minute = int(time.time()) // 60 * 60
+        depth = len(self._pending)
+        with self._db_lock:
+            conn = sqlite3.connect(self._db_path, timeout=5)
+            conn.execute(
+                """
+                INSERT INTO queue_depth (minute, depth) VALUES (?, ?)
+                ON CONFLICT(minute) DO UPDATE SET depth = MAX(depth, excluded.depth)
+                """,
+                (minute, depth),
+            )
+            conn.commit()
+            conn.close()
+
+    def history(self, hours=None):
+        hours = self._history_hours if hours is None else max(1, min(336, int(hours)))
+        now = int(time.time())
+        start = now - hours * 3600
+        if hours <= 6:
+            bucket = 60
+        elif hours <= 48:
+            bucket = 15 * 60
+        elif hours <= 24 * 7:
+            bucket = 3600
+        else:
+            bucket = 2 * 3600
+        start = start // bucket * bucket
+        calls = {}
+        totals = {}
+        depths = {}
+        if self._db_path:
+            with self._db_lock:
+                conn = sqlite3.connect(self._db_path, timeout=5)
+                for ts, cog, count in conn.execute(
+                    "SELECT (ts / ?) * ?, cog, COUNT(*) FROM calls WHERE ts >= ? GROUP BY 1, cog",
+                    (bucket, bucket, start),
+                ):
+                    calls.setdefault(int(ts), {})[cog] = int(count)
+                    totals[cog] = totals.get(cog, 0) + int(count)
+                for minute, depth in conn.execute(
+                    "SELECT minute, depth FROM queue_depth WHERE minute >= ?",
+                    (start,),
+                ):
+                    slot = int(minute) // bucket * bucket
+                    depths[slot] = max(depths.get(slot, 0), int(depth))
+                conn.close()
+        points = []
+        slot = start
+        while slot <= now:
+            points.append(
+                {
+                    "t": slot,
+                    "label": time.strftime("%m-%d %H:%M", time.gmtime(slot)),
+                    "calls": calls.get(slot, {}),
+                    "total": sum(calls.get(slot, {}).values()),
+                    "queue": depths.get(slot, 0),
+                }
+            )
+            slot += bucket
+        ranked = sorted(totals, key=lambda cog: (-totals[cog], cog))
+        stats = self.snapshot()
+        return {
+            **stats,
+            "hours": hours,
+            "bucket": bucket,
+            "points": points,
+            "totals": totals,
+            "cogs": ranked,
         }
 
     def _slot_wait(self):
@@ -104,6 +234,8 @@ class TornScheduler:
             self._wake = asyncio.Event()
         if self._worker is None or self._worker.done():
             self._worker = asyncio.get_running_loop().create_task(self._run())
+        if self._sampler is None or self._sampler.done():
+            self._sampler = asyncio.get_running_loop().create_task(self._sample_loop())
 
     async def request(self, cog_id, url, timeout=20):
         await self.ensure_started()
@@ -113,6 +245,7 @@ class TornScheduler:
             self._pending.append(
                 {"seq": self._seq, "cog": str(cog_id), "url": url, "timeout": timeout, "future": future}
             )
+            self._record_queue()
         self._wake.set()
         return await future
 
@@ -137,6 +270,7 @@ class TornScheduler:
                     continue
                 try:
                     await self.reserve()
+                    self.note_call(item["cog"])
                     async with self._session.get(item["url"], timeout=item["timeout"]) as response:
                         data = await response.json(content_type=None)
                         if response.status >= 400:
@@ -150,6 +284,12 @@ class TornScheduler:
         finally:
             await self._session.close()
             self._session = None
+
+    async def _sample_loop(self):
+        while True:
+            async with self._pending_lock:
+                self._record_queue()
+            await asyncio.sleep(10)
 
 
 _scheduler = TornScheduler()
