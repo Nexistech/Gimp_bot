@@ -280,10 +280,8 @@ class Verification(commands.Cog):
         if not TORN_API_KEY:
             return None
         url = f"https://api.torn.com/user/{int(discord_id)}?selections=discord,profile,basic&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=20) as response:
-                data = await response.json()
+        from torn_api import torn_json
+        data = await torn_json("verification", url, timeout=20)
         if data.get("error"):
             return None
         payload = data.get("discord") or {}

@@ -97,7 +97,6 @@ DRUG_FIELDS = (
 # Ketamine's minimum cooldown is 45 minutes, the shortest drug cooldown.
 # A full roster pass inside 30 minutes means only one drug can have been used.
 SWEEP_MINUTES = 30
-BATCH_PAUSE_SECONDS = 90
 NEWS_RE = re.compile(
     r"(?P<name>.+?)\s*(?:\[(?P<tid>\d+)\])?\s+overdosed on\s+(?P<drug>[^.]+)",
     re.I,
@@ -313,11 +312,8 @@ class OverdoseMonitor(commands.Cog):
             "https://api.torn.com/v2/faction/news?cat=main&striptags=false&limit=100"
             f"&key={TORN_API_KEY}&comment=GimpBot"
         )
-        headers = {"User-Agent": "GimpBot/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=20) as response:
-                response.raise_for_status()
-                data = await response.json(content_type=None)
+        from torn_api import torn_json
+        data = await torn_json("overdose", url, timeout=20)
         if isinstance(data, dict) and data.get("error"):
             log.error(f"[Overdose] API error: {data['error']}")
             return []
@@ -500,8 +496,8 @@ class OverdoseMonitor(commands.Cog):
             "https://api.torn.com/v2/user/"
             f"{int(user_id)}/personalstats?cat=drugs&key={TORN_API_KEY}&comment=GimpBot"
         )
-        async with session.get(url, timeout=20) as response:
-            data = await response.json(content_type=None)
+        from torn_api import torn_json
+        data = await torn_json("overdose", url, timeout=20)
         if isinstance(data, dict) and data.get("error"):
             raise RuntimeError(data["error"])
         drugs = (data.get("personalstats") or {}).get("drugs") or {}
@@ -585,12 +581,6 @@ class OverdoseMonitor(commands.Cog):
                     log.error(f"[Overdose] Stat lookup failed for {name} [{user_id}]: {exc}")
                     self.mark_checked(user_id, name)
                     await asyncio.sleep(0.4)
-                    if index % batch == 0 and index < len(picked):
-                        log.info(
-                            f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
-                            "so the shared API limit can recover."
-                        )
-                        await asyncio.sleep(BATCH_PAUSE_SECONDS)
                     continue
                 count = int(stats.get("overdoses") or 0)
                 conn = self.db()
@@ -635,12 +625,6 @@ class OverdoseMonitor(commands.Cog):
                             count,
                         )
                     await asyncio.sleep(0.4)
-                    if index % batch == 0 and index < len(picked):
-                        log.info(
-                            f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
-                            "so the shared API limit can recover."
-                        )
-                        await asyncio.sleep(BATCH_PAUSE_SECONDS)
                     continue
                 conn.execute(
                     "UPDATE od_counts SET name = ?, api_total = ?, stats_json = ?, checked_at = ? WHERE user_id = ?",
@@ -650,12 +634,6 @@ class OverdoseMonitor(commands.Cog):
                     conn.commit()
                     conn.close()
                     await asyncio.sleep(0.4)
-                    if index % batch == 0 and index < len(picked):
-                        log.info(
-                            f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
-                            "so the shared API limit can recover."
-                        )
-                        await asyncio.sleep(BATCH_PAUSE_SECONDS)
                     continue
                 od_delta = count - previous
                 used = self.note_drug_sample(conn, user_id, name, old_stats, stats, od_delta)
@@ -666,12 +644,6 @@ class OverdoseMonitor(commands.Cog):
                     if doses and self.watched(user_id):
                         channel = await self.deliver_use(channel, user_id, name, doses)
                     await asyncio.sleep(0.4)
-                    if index % batch == 0 and index < len(picked):
-                        log.info(
-                            f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
-                            "so the shared API limit can recover."
-                        )
-                        await asyncio.sleep(BATCH_PAUSE_SECONDS)
                     continue
                 delta = od_delta
                 year = utc_now().year
@@ -695,12 +667,6 @@ class OverdoseMonitor(commands.Cog):
                 entry_drug = drug
                 channel = await self.deliver_od(channel, user_id, name, entry_drug, year_count, count)
                 await asyncio.sleep(0.4)
-                if index % batch == 0 and index < len(picked):
-                    log.info(
-                        f"[Overdose] Pausing {BATCH_PAUSE_SECONDS}s after {index}/{len(picked)} "
-                        "so the shared API limit can recover."
-                    )
-                    await asyncio.sleep(BATCH_PAUSE_SECONDS)
                 self._pull_done = index
 
     @tasks.loop(minutes=5)
@@ -986,7 +952,14 @@ class OverdoseMonitor(commands.Cog):
             }
         )
         url = f"https://api.torn.com/user/{int(user_id)}?{qs}"
+        from torn_api import get_scheduler
+        scheduler = get_scheduler()
         req = urllib.request.Request(url, headers={"User-Agent": "StrikeBot/1.0"})
+        while True:
+            wait = scheduler._slot_wait()
+            if wait <= 0:
+                break
+            time.sleep(min(wait, 1))
         with urllib.request.urlopen(req, timeout=20) as response:
             data = json.loads(response.read().decode("utf-8"))
         if data.get("error"):

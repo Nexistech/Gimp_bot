@@ -118,11 +118,8 @@ class ArmoryTracker(commands.Cog):
             f"https://api.torn.com/faction/?selections={SELECTIONS}"
             f"&key={TORN_API_KEY}&comment=StrikeBot"
         )
-        headers = {"User-Agent": "StrikeBot/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=30) as response:
-                response.raise_for_status()
-                data = await response.json()
+        from torn_api import torn_json
+        data = await torn_json("armory", url, timeout=30)
         if data.get("error"):
             raise RuntimeError(data["error"])
         items = []

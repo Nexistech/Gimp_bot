@@ -1,19 +1,3 @@
-"""Armory deposit payouts.
-
-Polls faction armory news once a minute. A line is kept only when someone
-deposited items. Used, loaned, given, and returned lines are ignored.
-
-The first deposit of an item in 24 hours loads the public item market,
-averages the cheapest 10 listing prices, and caches that average. Later
-deposits of the same item reuse it until the cache is a day old.
-
-/payout shows the caller's own unpaid total unless they have a payout role.
-Those roles can look up any member, mark the balance paid, or press Done to
-check faction payday logs immediately. Only a "was paid ... from the faction"
-line counts, not a vault "was given" withdrawal. A separate clear role can
-zero a balance with /payout member:name clear:True.
-"""
-
 import datetime
 import os
 import re
@@ -296,11 +280,8 @@ class ArmoryPayout(commands.Cog):
         conn.close()
 
     async def torn_get(self, url):
-        headers = {"User-Agent": "GimpBot/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=20) as response:
-                response.raise_for_status()
-                data = await response.json(content_type=None)
+        from torn_api import torn_json
+        data = await torn_json("armory_payout", url, timeout=20)
         if isinstance(data, dict) and data.get("error"):
             raise RuntimeError(data["error"])
         return data

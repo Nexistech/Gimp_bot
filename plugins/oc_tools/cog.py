@@ -140,10 +140,8 @@ class OCToolsMonitor(commands.Cog):
             return
         url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}&comment=StrikeBot"
         try:
-            async with aiohttp.ClientSession(headers={"User-Agent": "StrikeBot/1.0"}) as session:
-                async with session.get(url, timeout=30) as response:
-                    response.raise_for_status()
-                    data = await response.json()
+            from torn_api import torn_json
+            data = await torn_json("oc_tools", url, timeout=30)
         except Exception as exc:
             log.error(f"[OC Tools] Item catalog fetch failed: {exc}")
             return

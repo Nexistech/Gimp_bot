@@ -211,11 +211,8 @@ class Banking(commands.Cog):
         if not TORN_API_KEY:
             raise RuntimeError("TORN_API_KEY missing")
         url = f"https://api.torn.com/faction/?selections=donations&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=20) as response:
-                response.raise_for_status()
-                data = await response.json()
+        from torn_api import torn_json
+        data = await torn_json("banking", url, timeout=20)
         if data.get("error"):
             raise RuntimeError(data["error"])
         return data.get("donations") or {}
@@ -227,11 +224,8 @@ class Banking(commands.Cog):
 
     async def fetch_funds_news(self):
         url = f"https://api.torn.com/faction/?selections=fundsnews&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=20) as response:
-                response.raise_for_status()
-                data = await response.json()
+        from torn_api import torn_json
+        data = await torn_json("banking", url, timeout=20)
         return data.get("fundsnews") or data.get("news") or {}
 
     def give_url(self, torn_id, amount):

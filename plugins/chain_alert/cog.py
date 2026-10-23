@@ -134,11 +134,8 @@ class ChainAlert(commands.Cog):
         if not TORN_API_KEY:
             return None
         url = f"https://api.torn.com/faction/?selections=chain&key={TORN_API_KEY}&comment=StrikeBot"
-        headers = {"User-Agent": "StrikeBot/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=20) as response:
-                response.raise_for_status()
-                data = await response.json()
+        from torn_api import torn_json
+        data = await torn_json("chain_alert", url, timeout=20)
         if data.get("error"):
             log.error(f"[Chain] API error: {data['error']}")
             return None

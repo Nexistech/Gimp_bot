@@ -1,10 +1,3 @@
-"""Find high weav3r prices for an item.
-
-Uses the OC tools item catalog when that plugin has already cached Torn item
-names. Otherwise reads plugins/oc_tools/oc_tools.db, then falls back to one
-Torn items API pull stored in this plugin's own database.
-"""
-
 import difflib
 import os
 import sqlite3
@@ -90,11 +83,9 @@ class FindTrader(commands.Cog):
             return {}
         url = f"https://api.torn.com/torn/?selections=items&key={TORN_API_KEY}&comment=GimpBot"
         try:
-            async with aiohttp.ClientSession(headers={"User-Agent": "GimpBot/1.0"}) as session:
-                async with session.get(url, timeout=30) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-        except (aiohttp.ClientError, TimeoutError) as exc:
+            from torn_api import torn_json
+            data = await torn_json("find_trader", url, timeout=30)
+        except Exception as exc:
             log.error(f"[FindTrader] Item catalog fetch failed: {exc}")
             return {}
         if data.get("error"):

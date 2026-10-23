@@ -152,11 +152,8 @@ class FactionRoster(commands.Cog):
         return parsed._replace(query=urlencode(params)).geturl()
 
     async def fetch_json(self, url, timeout_seconds=20):
-        headers = {"User-Agent": "StrikeBot/1.0"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=timeout_seconds) as response:
-                response.raise_for_status()
-                return await response.json()
+        from torn_api import torn_json
+        return await torn_json("faction_roster", url, timeout=timeout_seconds)
 
     async def lookup_discord_id(self, torn_id):
         if not TORN_API_KEY:

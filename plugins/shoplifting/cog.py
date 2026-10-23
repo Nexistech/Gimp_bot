@@ -76,14 +76,11 @@ class ShopliftingMonitor(commands.Cog):
             logger.error("No TORN_API_KEY found.")
             return None
         url = f"https://api.torn.com/torn/?selections=shoplifting&key={TORN_API_KEY}"
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, timeout=10) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    logger.error("API Error: Status %s", response.status)
-            except Exception as e:
-                logger.error("Exception during API fetch: %s", e)
+        try:
+            from torn_api import torn_json
+            return await torn_json("shoplifting", url, timeout=10)
+        except Exception as e:
+            logger.error("Exception during API fetch: %s", e)
         return None
 
     @tasks.loop(minutes=1.0)
