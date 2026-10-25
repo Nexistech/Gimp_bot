@@ -465,9 +465,19 @@ class Verification(commands.Cog):
                 await member.edit(nick=plan["nick"], reason=plan["reason"])
             except discord.HTTPException:
                 pass
-        await self.log(
-            f"Marked {member.mention} as Torn-linked `{torn.get('name')}` [{torn.get('id')}] (not in faction)."
-        )
+        if plan["add"] or plan["remove"] or plan["nick"]:
+            bits = []
+            if plan["add"]:
+                bits.append("added " + ", ".join(role.name for role in plan["add"]))
+            if plan["remove"]:
+                bits.append("removed " + ", ".join(role.name for role in plan["remove"]))
+            if plan["nick"]:
+                bits.append(f"nickname → `{plan['nick']}`")
+            await self.log(
+                f"Updated {member.mention} (`{torn.get('name')}` [{torn.get('id')}]), not in faction: "
+                + "; ".join(bits)
+                + "."
+            )
         return plan
 
     @commands.Cog.listener()
@@ -640,7 +650,14 @@ class Verification(commands.Cog):
             if torn:
                 await self.apply_torn_user_only(member, torn)
             else:
-                await self.mark_unverified(member, "Daily check: not Torn-linked")
+                plan = await self.mark_unverified(member, "Daily check: not Torn-linked")
+                if plan and (plan.get("add") or plan.get("remove")):
+                    bits = []
+                    if plan.get("add"):
+                        bits.append("added " + ", ".join(role.name for role in plan["add"]))
+                    if plan.get("remove"):
+                        bits.append("removed " + ", ".join(role.name for role in plan["remove"]))
+                    await self.log(f"Updated {member.mention}, not Torn-linked: " + "; ".join(bits) + ".")
             await asyncio.sleep(0.4)
 
     @daily_task.before_loop
